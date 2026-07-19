@@ -1,2 +1,7 @@
 /.specstory
 document/chat-gemini-before.md
+.diagnostics/
+output/
+__pycache__/
+*.pyc
+/document/req
