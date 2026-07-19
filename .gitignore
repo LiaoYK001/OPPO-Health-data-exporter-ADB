@@ -2,6 +2,9 @@
 document/chat-gemini-before.md
 .diagnostics/
 output/
+data/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 /document/req
