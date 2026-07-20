@@ -42,6 +42,18 @@ def prepare_server(adb: AdbClient, private_dir: Path) -> tuple[Path, str]:
     if abi is None:
         raise ExporterError(f"Frida 暂不支持该模拟器 ABI：{android_abi}")
     asset_name = f"frida-server-{version}-android-{abi}.xz"
+    tools_dir = private_dir / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    compressed = tools_dir / asset_name
+    server = tools_dir / asset_name.removesuffix(".xz")
+    server_digest_path = server.with_suffix(server.suffix + ".sha256")
+    if server.exists():
+        if server_digest_path.exists():
+            expected_server = server_digest_path.read_text(encoding="ascii").strip()
+            actual_server = hashlib.sha256(server.read_bytes()).hexdigest()
+            if actual_server != expected_server:
+                raise ExporterError("本地 Frida Server 哈希不匹配，拒绝继续使用。")
+        return server, version
     release_url = f"https://api.github.com/repos/frida/frida/releases/tags/{version}"
     request = urllib.request.Request(release_url, headers={"User-Agent": "ohealth-exporter"})
     try:
@@ -56,24 +68,23 @@ def prepare_server(adb: AdbClient, private_dir: Path) -> tuple[Path, str]:
     if not digest.startswith("sha256:"):
         raise ExporterError("Frida 官方发布未提供 SHA-256，拒绝使用未校验二进制。")
     expected = digest.split(":", 1)[1].lower()
-    tools_dir = private_dir / "tools"
-    tools_dir.mkdir(parents=True, exist_ok=True)
-    compressed = tools_dir / asset_name
-    server = tools_dir / asset_name.removesuffix(".xz")
-    if not server.exists():
-        try:
-            with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
-                payload = response.read()
-        except Exception as exc:
-            raise ExporterError(f"下载 Frida Server 失败：{exc}") from exc
-        actual = hashlib.sha256(payload).hexdigest()
-        if actual != expected:
-            raise ExporterError(
-                f"Frida Server SHA-256 不匹配：expected={expected}, actual={actual}"
-            )
-        compressed.write_bytes(payload)
-        server.write_bytes(lzma.decompress(payload))
-        compressed.unlink(missing_ok=True)
+    try:
+        with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
+            payload = response.read()
+    except Exception as exc:
+        raise ExporterError(f"下载 Frida Server 失败：{exc}") from exc
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise ExporterError(
+            f"Frida Server SHA-256 不匹配：expected={expected}, actual={actual}"
+        )
+    compressed.write_bytes(payload)
+    server_payload = lzma.decompress(payload)
+    server.write_bytes(server_payload)
+    server_digest_path.write_text(
+        hashlib.sha256(server_payload).hexdigest(), encoding="ascii"
+    )
+    compressed.unlink(missing_ok=True)
     return server, version
 
 
@@ -82,10 +93,18 @@ def capture_database_key(
     private_dir: Path,
     plaintext_output: Path,
     timeout: int = 45,
+    process_name: str = PACKAGE,
 ) -> dict[str, Any]:
     """Capture the passphrase and export a temporary plaintext copy through SQLCipher."""
     if not adb.root_available():
         raise RootRequiredError("key-capture 需要短暂开启 MuMu Root 并重启。")
+    pid_values = adb.shell("pidof", process_name, check=False).split()
+    if len(pid_values) != 1 or not pid_values[0].isdigit():
+        raise ExporterError(
+            f"未找到唯一的 OPPO 健康进程 {process_name}。key-capture 不会自动启动 APP；"
+            "请关闭 Root、启动 APP，再热开启 Root。"
+        )
+    app_pid = int(pid_values[0])
     frida = _frida_module()
     server, version = prepare_server(adb, private_dir)
     remote = f"/data/local/tmp/ohealth-frida-server-{version}"
@@ -102,36 +121,105 @@ def capture_database_key(
     export_finished = threading.Event()
     state: dict[str, Any] = {}
     script_source = r"""
-Java.perform(function () {
-  const AppDatabase = Java.use('com.heytap.databaseengineservice.db.AppDatabase');
-  const initialize = AppDatabase.v.overload('android.content.Context', 'java.lang.String');
-  const getDatabase = AppDatabase.K.overload('android.content.Context');
-  let exported = false;
-  initialize.implementation = function (context, passphrase) {
-    send({kind: 'ohealth-db-key', value: String(passphrase)});
-    return initialize.call(this, context, passphrase);
-  };
-  getDatabase.implementation = function (context) {
-    const room = getDatabase.call(this, context);
-    if (!exported) {
-      exported = true;
-      const output = context.getCacheDir().getAbsolutePath() + '/ohealth-plaintext-export.db';
+send({kind: 'ohealth-stage', value: 'loaded;java=' + String(Java.available)});
+if (!Java.available) {
+  send({kind: 'ohealth-db-export-error', value: 'Java VM is not available in target process'});
+}
+Java.performNow(function () {
+  send({kind: 'ohealth-stage', value: 'java-ready'});
+  const Encryptor = Java.use('com.oplus.aiunit.vision.ev4');
+  const SQLiteDatabase = Java.use('net.zetetic.database.sqlcipher.SQLiteDatabase');
+  send({kind: 'ohealth-stage', value: 'database-class-ready'});
+  function exportDatabase(context) {
+      const passphrase = Encryptor.$new().t0(context);
+      send({kind: 'ohealth-db-key', value: String(passphrase)});
+      const source = context.getDatabasePath('database.db').getAbsolutePath();
+      const output = context.getDatabasePath('ohealth-plaintext-export.db').getAbsolutePath();
       try {
         const File = Java.use('java.io.File');
-        File.$new(output).delete();
-        const db = room.getOpenHelper().getWritableDatabase();
+        const outputFile = File.$new(output);
+        outputFile.delete();
+        if (!outputFile.createNewFile()) {
+          throw new Error('unable to create temporary database file');
+        }
+        const openDatabase = SQLiteDatabase.openDatabase.overload(
+          'java.lang.String',
+          'java.lang.String',
+          'net.zetetic.database.sqlcipher.SQLiteDatabase$CursorFactory',
+          'int',
+          'net.zetetic.database.sqlcipher.SQLiteDatabaseHook'
+        );
+        const db = openDatabase.call(SQLiteDatabase, source, String(passphrase), null, 0, null);
         db.execSQL("ATTACH DATABASE '" + output + "' AS plaintext KEY ''");
-        db.query("SELECT sqlcipher_export('plaintext')").close();
+        const exportCursor = db.query("SELECT sqlcipher_export('plaintext')");
+        exportCursor.moveToFirst();
+        exportCursor.close();
         db.execSQL('DETACH DATABASE plaintext');
+        db.close();
         send({kind: 'ohealth-db-export', value: String(output)});
       } catch (error) {
         send({kind: 'ohealth-db-export-error', value: String(error.stack || error)});
       }
+  }
+  (function () {
+    send({kind: 'ohealth-stage', value: 'context-lookup'});
+    function openDatabase(application) {
+      exportDatabase(application.getApplicationContext());
     }
-    return room;
-  };
+    try {
+      const ActivityThread = Java.use('android.app.ActivityThread');
+      let application = ActivityThread.currentApplication();
+      if (application !== null) {
+        openDatabase(application);
+        return;
+      }
+      const AppGlobals = Java.use('android.app.AppGlobals');
+      application = AppGlobals.getInitialApplication();
+      if (application !== null) {
+        openDatabase(application);
+        return;
+      }
+      let matched = false;
+      Java.choose('com.heytap.health.main.MainActivity', {
+        onMatch: function (activity) {
+          if (!matched) {
+            matched = true;
+            openDatabase(activity);
+          }
+        },
+        onComplete: function () {
+          if (!matched) {
+            send({kind: 'ohealth-db-export-error', value: 'no Application or MainActivity instance'});
+          }
+        }
+      });
+    } catch (error) {
+      send({kind: 'ohealth-db-export-error', value: String(error.stack || error)});
+    }
+  })();
 });
 """
+    if int(version.split(".", 1)[0]) >= 17:
+        agent_dir = private_dir / "tools" / "frida-agent"
+        bridge_dir = agent_dir / "node_modules" / "frida-java-bridge"
+        if not bridge_dir.exists():
+            raise ExporterError(
+                "Frida 17 需要 Java Bridge。请执行："
+                f"npm install --prefix \"{agent_dir}\" frida-java-bridge"
+            )
+        entry = agent_dir / "ohealth-agent.js"
+        entry.write_text(
+            'import Java from "frida-java-bridge";\n' + script_source,
+            encoding="utf-8",
+        )
+        diagnostics: list[str] = []
+        compiler = frida.Compiler()
+        compiler.on("diagnostics", lambda value: diagnostics.append(str(value)))
+        try:
+            script_source = compiler.build(str(entry), project_root=str(agent_dir))
+        except Exception as exc:
+            detail = "; ".join(diagnostics[-5:])
+            raise ExporterError(f"编译 Frida Java Bridge 失败：{exc}; {detail}") from exc
 
     def on_message(message: dict[str, Any], data: bytes | None) -> None:
         if message.get("type") == "send":
@@ -144,7 +232,10 @@ Java.perform(function () {
                 export_finished.set()
             elif payload.get("kind") == "ohealth-db-export-error":
                 state["export_error"] = str(payload["value"])
+                key_found.set()
                 export_finished.set()
+            elif payload.get("kind") == "ohealth-stage":
+                state.setdefault("stages", []).append(str(payload["value"]))
         elif message.get("type") == "error":
             state["error"] = message.get("stack") or message.get("description")
             key_found.set()
@@ -155,20 +246,27 @@ Java.perform(function () {
     try:
         manager = frida.get_device_manager()
         device = manager.add_remote_device("127.0.0.1:27042")
-        adb.force_stop(PACKAGE)
-        pid = device.spawn([PACKAGE])
-        session = device.attach(pid)
+        try:
+            session = device.attach(app_pid)
+        except Exception as exc:
+            raise ExporterError(
+                f"无法附加到已确认的 OPPO 健康进程 {process_name} (PID {app_pid})；"
+                "进程可能已退出，命令不会自动重启 APP。"
+            ) from exc
         script = session.create_script(script_source)
         script.on("message", on_message)
         script.load()
-        device.resume(pid)
         if not key_found.wait(timeout):
             raise ExporterError(
-                "等待数据库初始化超时。保持 Root 开启，重新运行 key-capture；"
-                "无需在风险提示中点击确认。"
+                "等待数据库初始化超时。阶段="
+                f"{','.join(state.get('stages', [])) or 'none'}。"
+                "保持 Root 开启，重新运行 key-capture；无需在风险提示中点击确认。"
             )
         if "key" not in state:
-            raise ExporterError(f"Frida 脚本失败：{state.get('error', 'unknown error')}")
+            raise ExporterError(
+                "Frida 脚本失败："
+                f"{state.get('export_error', state.get('error', 'unknown error'))}"
+            )
         key_path = private_dir / "oppo-database.passphrase"
         key_path.parent.mkdir(parents=True, exist_ok=True)
         key_path.write_text(state["key"], encoding="utf-8")
@@ -196,6 +294,7 @@ Java.perform(function () {
             "plaintext_path": str(plaintext_output.resolve()),
             "plaintext_sha256": plaintext_sha256,
             "frida_version": version,
+            "process_name": process_name,
         }
     finally:
         if script is not None:
@@ -210,5 +309,10 @@ Java.perform(function () {
                 pass
         if state.get("remote_plaintext"):
             adb.su(f"rm -f {AdbClient.quote(state['remote_plaintext'])}", check=False)
+        adb.su(
+            "rm -f /data/user/0/com.heytap.health/cache/ohealth-plaintext-export.db "
+            "/data/user/0/com.heytap.health/databases/ohealth-plaintext-export.db",
+            check=False,
+        )
         adb.su("pkill -f ohealth-frida-server", check=False)
         adb.run("forward", "--remove", "tcp:27042", check=False)

@@ -23,6 +23,7 @@ from .constants import (
     EXPECTED_SIZE,
     PACKAGE,
     PRIMARY_METRICS,
+    UI_PROFILES,
 )
 from .db import Database
 from .errors import ExporterError, RootRequiredError, VersionMismatchError
@@ -197,10 +198,16 @@ def inventory(args: argparse.Namespace) -> int:
                     f"发现尚未映射的健康卡片：{title}",
                     metric=f"unmapped:{title}",
                 )
-            runtime.db.finish_run(run_id, "complete" if adb.root_available() else "partial")
+            if not ui_inventory["unknown"]:
+                runtime.db.resolve_failures(
+                    source_id,
+                    resolution=f"首页重新盘点通过：{run_id}",
+                    stage="inventory",
+                )
+            runtime.db.finish_run(run_id, "complete" if not ui_inventory["unknown"] else "partial")
             manifest["manifest_path"] = str(path.resolve())
             json_print(manifest)
-            return 0 if adb.root_available() and not ui_inventory["unknown"] else 2
+            return 0 if not ui_inventory["unknown"] else 2
         except Exception as exc:
             runtime.db.record_failure(run_id, "inventory", exc)
             runtime.db.finish_run(run_id, "failed", str(exc))
@@ -262,6 +269,7 @@ def key_capture(args: argparse.Namespace) -> int:
                 runtime.data_dir / "private",
                 plaintext,
                 args.timeout,
+                args.process,
             )
             artifact = runtime.artifacts.put_file(
                 plaintext, media_type="application/vnd.sqlite3"
@@ -323,6 +331,14 @@ def key_capture(args: argparse.Namespace) -> int:
             )
             result["source_extract"] = adapter.extract(snapshot, source_id, run_id)
             result["manifest_path"] = str(manifest_path.resolve())
+            result["coverage_reconcile"] = runtime.db.reconcile_no_data_coverage(
+                source_id, run_id, PRIMARY_METRICS
+            )
+            runtime.db.resolve_failures(
+                source_id,
+                resolution=f"SQLCipher 导出成功：{run_id}",
+                stage="key_capture",
+            )
             runtime.db.finish_run(run_id, "complete")
             json_print({"run_id": run_id, **result})
             return 0
@@ -430,21 +446,59 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                 ui_results = []
                 for metric in _parse_metrics(args.metrics):
                     date_range = runtime.db.metric_date_range(source_id, metric)
+                    profile = UI_PROFILES[metric]
+                    home_card_present = any(
+                        title in home["included"] for title in profile.home_titles
+                    )
+                    if date_range is None and not home_card_present:
+                        runtime.db.set_coverage(
+                            source_id,
+                            metric,
+                            dt.date.today().isoformat(),
+                            "no_data",
+                            {
+                                "database": False,
+                                "ui": False,
+                                "home_card_present": False,
+                                "basis": "source_empty_and_home_catalog_absent",
+                            },
+                            run_id,
+                        )
+                        runtime.db.connection.commit()
+                        runtime.db.resolve_failures(
+                            source_id,
+                            metric=metric,
+                            resolution=f"源表为空且首页目录无卡片：{run_id}",
+                        )
+                        ui_results.append(
+                            {
+                                "metric": metric,
+                                "captured": 0,
+                                "no_data": True,
+                                "reason": "source_empty_and_home_catalog_absent",
+                            }
+                        )
+                        continue
                     earliest = (
                         dt.date.fromisoformat(date_range[0])
                         if date_range
                         else dt.date.today()
                     )
                     try:
-                        ui_results.append(
-                            collector.capture_history(
+                        capture_result = collector.capture_history(
                                 metric,
                                 earliest_date=earliest,
                                 max_days=args.max_days,
                                 resume=args.resume,
                                 capture_subpages=not args.no_subpages,
                             )
-                        )
+                        ui_results.append(capture_result)
+                        if capture_result["failures"] == 0 and capture_result["captured"] > 0:
+                            runtime.db.resolve_failures(
+                                source_id,
+                                metric=metric,
+                                resolution=f"UI 重新采集通过：{run_id}",
+                            )
                     except Exception as exc:
                         runtime.db.record_failure(run_id, "metric_ui", exc, metric=metric)
                         runtime.db.set_coverage(
@@ -458,6 +512,9 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                         runtime.db.connection.commit()
                         ui_results.append({"metric": metric, "failed": str(exc)})
                 result["ui"] = ui_results
+            result["coverage_reconcile"] = runtime.db.reconcile_no_data_coverage(
+                source_id, run_id, PRIMARY_METRICS
+            )
             runtime.db.finish_run(run_id, "complete")
             return result
         except KeyboardInterrupt:
@@ -611,6 +668,11 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument("--no-restart-app", action="store_true")
     key_parser = commands.add_parser("key-capture", help="短暂 Root 下只读截取 SQLCipher 密钥")
     key_parser.add_argument("--timeout", type=int, default=45)
+    key_parser.add_argument(
+        "--process",
+        default=PACKAGE,
+        help="仅附加到已存在的 APP 进程名，不会启动进程",
+    )
     collect_parser = commands.add_parser("collect", help="采集并规范化全部历史")
     _add_collect_arguments(collect_parser)
     run_parser = commands.add_parser("run", help="采集、校验并导出 CSV/XLSX")

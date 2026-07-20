@@ -209,8 +209,7 @@ class UiCollector:
         return path
 
     def inventory_home(self, max_scrolls: int = 12) -> dict[str, Any]:
-        self.adb.start_activity(MAIN_ACTIVITY)
-        time.sleep(1.5)
+        self._ensure_home()
         self.dismiss_known_popups()
         self._scroll_to_top()
         cards: set[str] = set()
@@ -273,8 +272,7 @@ class UiCollector:
         if metric not in UI_PROFILES:
             raise ExporterError(f"未知 UI 指标：{metric}")
         profile = UI_PROFILES[metric]
-        self.adb.start_activity(MAIN_ACTIVITY)
-        time.sleep(1.2)
+        self._ensure_home()
         self.dismiss_known_popups()
         self._scroll_to_top()
         with tempfile.TemporaryDirectory(prefix=f"ohealth-enter-{metric}-") as temp:
@@ -302,7 +300,15 @@ class UiCollector:
                         self.adb.tap(*center(bounds))
                         time.sleep(1.5)
                         detail, _ = self.dump_tree(Path(temp), "detail")
-                        if any(detail.by_text(title) is not None for title in profile.page_titles):
+                        expected_activity = (
+                            metric == "weight"
+                            and self.adb.foreground().endswith(
+                                "/com.heytap.health.bodyfat.ui.BodyFatDetailsActivity"
+                            )
+                        )
+                        if expected_activity or any(
+                            detail.by_text(title) is not None for title in profile.page_titles
+                        ):
                             self._select_day_tab(detail)
                             return detail
                         raise ExporterError(f"点击 {metric} 后未进入预期详情页。")
@@ -384,6 +390,8 @@ class UiCollector:
                     self.run_id,
                 )
                 self.db.connection.commit()
+            if max_days is not None and visited >= max_days:
+                break
             if current_date == earliest_date:
                 break
             if not self._go_previous_day(profile, current_date):
@@ -598,7 +606,26 @@ class UiCollector:
                 time.sleep(0.6)
         return dismissed
 
-    def _scroll_to_top(self, max_swipes: int = 6) -> None:
+    def _ensure_home(self, max_backs: int = 10) -> None:
+        main_suffix = "/com.heytap.health.main.MainActivity"
+        foreground = self.adb.foreground()
+        if foreground.endswith(main_suffix):
+            return
+        for _ in range(max_backs):
+            if not foreground.startswith(PACKAGE + "/"):
+                break
+            self.adb.keyevent("BACK")
+            time.sleep(0.45)
+            foreground = self.adb.foreground()
+            if foreground.endswith(main_suffix):
+                return
+        self.adb.start_activity(MAIN_ACTIVITY)
+        time.sleep(1.2)
+        foreground = self.adb.foreground()
+        if not foreground.endswith(main_suffix):
+            raise ExporterError(f"无法复位到 OPPO 健康首页，当前前台：{foreground}")
+
+    def _scroll_to_top(self, max_swipes: int = 12) -> None:
         self.adb.shell("cmd", "statusbar", "collapse", check=False)
         with tempfile.TemporaryDirectory(prefix="ohealth-scroll-top-") as temp:
             previous: str | None = None
@@ -620,14 +647,15 @@ class UiCollector:
             return False
         x1, y1, x2, y2 = bounds
         x = (x1 + x2) // 2
-        top = y1 + max(40, (y2 - y1) // 8)
-        bottom = y2 - max(40, (y2 - y1) // 8)
+        height = y2 - y1
+        top = y1 + max(40, int(height * 0.35))
+        bottom = y1 + min(height - 40, int(height * 0.65))
         if bottom <= top:
             return False
         if down:
-            self.adb.swipe(x, top, x, bottom, 350)
+            self.adb.swipe(x, top, x, bottom, 700)
         else:
-            self.adb.swipe(x, bottom, x, top, 350)
+            self.adb.swipe(x, bottom, x, top, 700)
         return True
 
     def _capture_chart_crops(

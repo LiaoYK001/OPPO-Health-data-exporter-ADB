@@ -54,7 +54,7 @@ class MetricUiProfile:
 UI_PROFILES = {
     "activity": MetricUiProfile(
         metric="activity",
-        home_titles=("每日活动",),
+        home_titles=("每日活动", "步数", "消耗"),
         page_titles=("每日活动",),
         date_ids=("tv_daily_date",),
         subpage_titles=("步数", "活动消耗", "锻炼时长", "活动次数"),
@@ -87,7 +87,7 @@ UI_PROFILES = {
     "weight": MetricUiProfile(
         metric="weight",
         home_titles=("体重",),
-        page_titles=("体重",),
+        page_titles=("体重", "公斤"),
         date_ids=("tv_date", "weight_date"),
     ),
     "stress": MetricUiProfile(

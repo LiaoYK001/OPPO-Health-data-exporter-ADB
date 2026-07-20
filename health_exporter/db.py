@@ -15,7 +15,7 @@ from .constants import FIDELITY_VALUES
 from .errors import ExporterError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -240,7 +240,9 @@ CREATE TABLE IF NOT EXISTS failures (
     error_type TEXT NOT NULL,
     message TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -298,7 +300,23 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (1, utc_now()),
             )
-            self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.connection.execute("PRAGMA user_version=1")
+            self.connection.commit()
+            current = 1
+        if current < 2:
+            columns = {
+                str(row[1])
+                for row in self.connection.execute("PRAGMA table_info(failures)")
+            }
+            if "resolved_at" not in columns:
+                self.connection.execute("ALTER TABLE failures ADD COLUMN resolved_at TEXT")
+            if "resolution" not in columns:
+                self.connection.execute("ALTER TABLE failures ADD COLUMN resolution TEXT")
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (2, utc_now()),
+            )
+            self.connection.execute("PRAGMA user_version=2")
             self.connection.commit()
 
     def _load_or_create_salt(self) -> bytes:
@@ -807,6 +825,69 @@ class Database:
             ),
         )
 
+    def reconcile_no_data_coverage(
+        self,
+        source_id: int,
+        run_id: str,
+        metrics: Iterator[str] | tuple[str, ...] | list[str],
+        through_date: dt.date | None = None,
+    ) -> dict[str, int]:
+        through = through_date or dt.date.today()
+        global_first_value = self.connection.execute(
+            "SELECT MIN(local_date) FROM daily_metrics_current WHERE source_id=?",
+            (source_id,),
+        ).fetchone()[0]
+        if global_first_value is None:
+            return {}
+        global_first = dt.date.fromisoformat(str(global_first_value))
+        counts: dict[str, int] = {}
+        with self.transaction():
+            for metric in metrics:
+                source_dates = {
+                    str(row[0])
+                    for row in self.connection.execute(
+                        """
+                        SELECT local_date FROM daily_metrics_current
+                        WHERE source_id=? AND canonical_metric=?
+                        """,
+                        (source_id, metric),
+                    )
+                }
+                first = (
+                    dt.date.fromisoformat(min(source_dates))
+                    if source_dates
+                    else global_first
+                )
+                inserted = 0
+                day = first
+                while day <= through:
+                    local_date = day.isoformat()
+                    if local_date not in source_dates:
+                        existing = self.connection.execute(
+                            """
+                            SELECT status FROM coverage
+                            WHERE source_id=? AND canonical_metric=? AND local_date=?
+                            """,
+                            (source_id, metric, local_date),
+                        ).fetchone()
+                        if existing is None or existing["status"] in {"failed", "visual_only"}:
+                            self.set_coverage(
+                                source_id,
+                                metric,
+                                local_date,
+                                "no_data",
+                                {
+                                    "database": False,
+                                    "ui": False,
+                                    "basis": "exact_source_absence",
+                                },
+                                run_id,
+                            )
+                            inserted += 1
+                    day += dt.timedelta(days=1)
+                counts[metric] = inserted
+        return counts
+
     def set_checkpoint(
         self,
         source_id: int,
@@ -860,6 +941,33 @@ class Database:
                 utc_now(),
             ),
         )
+
+    def resolve_failures(
+        self,
+        source_id: int,
+        *,
+        resolution: str,
+        metric: str | None = None,
+        stage: str | None = None,
+    ) -> int:
+        clauses = ["run_id IN (SELECT id FROM ingest_runs WHERE source_id=?)", "resolved_at IS NULL"]
+        parameters: list[Any] = [source_id]
+        if metric is not None:
+            clauses.append("canonical_metric=?")
+            parameters.append(metric)
+        if stage is not None:
+            clauses.append("stage=?")
+            parameters.append(stage)
+        parameters.extend([utc_now(), resolution])
+        cursor = self.connection.execute(
+            f"""
+            UPDATE failures SET resolved_at=?, resolution=?
+            WHERE {' AND '.join(clauses)}
+            """,
+            (*parameters[-2:], *parameters[:-2]),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
         self.connection.commit()
 
     def metric_date_range(self, source_id: int, metric: str) -> tuple[str, str] | None:

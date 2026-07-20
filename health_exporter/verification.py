@@ -129,7 +129,7 @@ class Verifier:
                 """
                 SELECT COUNT(*) FROM failures f
                 JOIN ingest_runs r ON r.id=f.run_id
-                WHERE r.source_id=?
+                WHERE r.source_id=? AND f.resolved_at IS NULL
                 """,
                 (source,),
             ).fetchone()[0]
