@@ -27,6 +27,7 @@ from .constants import (
 from .db import Database
 from .errors import ExporterError, RootRequiredError, VersionMismatchError
 from .exporting import DailyExporter
+from .frida_bridge import capture_database_key
 from .ui import UiCollector, local_id, node_label
 from .vendor.base import SnapshotFile, SnapshotResult
 from .vendor.oppo import OppoAdapter
@@ -104,6 +105,9 @@ def doctor(args: argparse.Namespace) -> int:
     while not disk_probe.exists() and disk_probe != disk_probe.parent:
         disk_probe = disk_probe.parent
     free = shutil.disk_usage(disk_probe)
+    phase = args.phase
+    if phase == "auto":
+        phase = "source" if root else "ui"
     checks = [
         ("ADB 设备", args.serial in devices, args.serial),
         ("Android", bool(android), android or "未知"),
@@ -112,15 +116,31 @@ def doctor(args: argparse.Namespace) -> int:
         ("系统语言", locale.lower().startswith("zh"), locale or "未知"),
         ("OPPO 健康", installed, "已安装" if installed else "未安装"),
         ("APP 版本", version == EXPECTED_APP_VERSION, version or "未知"),
-        ("Root", root, "uid=0" if root else "未开启"),
+        (
+            "Root 阶段状态",
+            root if phase == "source" else not root,
+            "已开启（适合源快照，OPPO 健康会退出）"
+            if root
+            else "已关闭（适合 UI 页面采集）",
+        ),
         ("前台应用", foreground.startswith(PACKAGE + "/"), foreground),
         ("磁盘空间", free.free >= 10 * 1024**3, f"剩余 {free.free / 1024**3:.1f} GiB"),
     ]
-    print(f"OPPO 健康导出器 {__version__} 环境检查")
+    phase_name = "Root 源快照" if phase == "source" else "非 Root UI 采集"
+    print(f"OPPO 健康导出器 {__version__} 环境检查：{phase_name}")
     for name, ok, detail in checks:
         print(f"  {'[OK]' if ok else '[!!]'} {name}: {detail}")
-    print("\n正式全量运行前还需在 MuMu 应用中心关闭 OPPO 健康自动更新。")
+    if root:
+        print(
+            "\n检测到 Root：请只执行 snapshot-source/key-capture；"
+            "OPPO 健康出现风险提示并退出属于应用的 Root 检测。"
+        )
+    else:
+        print("\nRoot 已关闭：可以执行 inventory 或 collect --ui-only。")
+    print("正式全量运行前还需在 MuMu 应用中心关闭 OPPO 健康自动更新。")
     hard = [0, 2, 3, 5, 6, 7, 9]
+    if phase == "ui":
+        hard.append(8)
     return 0 if all(checks[index][1] for index in hard) else 2
 
 
@@ -225,6 +245,93 @@ def snapshot_source(args: argparse.Namespace) -> int:
             raise
 
 
+def key_capture(args: argparse.Namespace) -> int:
+    with Runtime(args, require_adb=True) as runtime:
+        adb, source_id = runtime.require_device()
+        run_id = runtime.db.start_run(
+            source_id,
+            "key-capture",
+            runtime.app_version,
+            adb.serial,
+            {"timeout": args.timeout},
+        )
+        try:
+            plaintext = runtime.data_dir / "raw" / "oppo" / "decrypted" / run_id / "database.db"
+            result = capture_database_key(
+                adb,
+                runtime.data_dir / "private",
+                plaintext,
+                args.timeout,
+            )
+            artifact = runtime.artifacts.put_file(
+                plaintext, media_type="application/vnd.sqlite3"
+            )
+            adapter = OppoAdapter(
+                adb,
+                runtime.db,
+                runtime.artifacts,
+                runtime.data_dir,
+                runtime.app_version,
+                restart_app=False,
+            )
+            sqlite_status, tables, schema_hash, row_count = adapter._inspect_file(plaintext)
+            if sqlite_status != "sqlite":
+                raise ExporterError(
+                    f"SQLCipher 导出文件不是可读 SQLite：{sqlite_status}"
+                )
+            runtime.db.add_raw_snapshot(
+                run_id=run_id,
+                source_path="frida://sqlcipher_export/database.db",
+                artifact_sha256=artifact.sha256,
+                sqlite_status=sqlite_status,
+                schema_hash=schema_hash,
+                table_count=len(tables),
+                row_count=row_count,
+            )
+            result["artifact_sha256"] = artifact.sha256
+            manifest_path = runtime.data_dir / "manifests" / f"oppo-decrypted-{run_id}.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "source": "frida://sqlcipher_export/database.db",
+                        "local_path": plaintext.relative_to(runtime.data_dir).as_posix(),
+                        "sha256": artifact.sha256,
+                        "tables": tables,
+                        "schema_hash": schema_hash,
+                        "target_row_count": row_count,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            runtime.artifacts.put_file(manifest_path, media_type="application/json")
+            snapshot = SnapshotResult(
+                run_id,
+                (
+                    SnapshotFile(
+                        remote_path="frida://sqlcipher_export/database.db",
+                        local_path=plaintext,
+                        artifact_sha256=artifact.sha256,
+                        sqlite_status="sqlite",
+                        tables=tuple(tables),
+                    ),
+                ),
+                manifest_path,
+            )
+            result["source_extract"] = adapter.extract(snapshot, source_id, run_id)
+            result["manifest_path"] = str(manifest_path.resolve())
+            runtime.db.finish_run(run_id, "complete")
+            json_print({"run_id": run_id, **result})
+            return 0
+        except Exception as exc:
+            runtime.db.record_failure(run_id, "key_capture", exc)
+            runtime.db.finish_run(run_id, "failed", str(exc))
+            raise
+
+
 def _latest_snapshot(data_dir: Path) -> SnapshotResult:
     candidates = sorted((data_dir / "manifests").glob("oppo-snapshot-*.json"))
     if not candidates:
@@ -259,6 +366,12 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
         adb, source_id = runtime.require_device()
         if not args.ui_only and not adb.root_available():
             raise RootRequiredError("严格 collect 必须开启 Root；仅调试 UI 时可显式使用 --ui-only。")
+        if adb.root_available() and not args.skip_ui and not args.ui_only:
+            raise ExporterError(
+                "当前 OPPO 健康会在 Root 环境下主动退出，不能在同一次运行中完成源快照和 UI 遍历。"
+                "请先执行 snapshot-source；关闭 Root 并重启 MuMu 后，再执行 "
+                "collect --ui-only --all-history --resume。"
+            )
         options = {
             "all_history": args.all_history,
             "resume": args.resume,
@@ -485,11 +598,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-version-mismatch", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    commands.add_parser("doctor", help="检查 ADB、Root、版本、显示和磁盘")
+    doctor_parser = commands.add_parser("doctor", help="按源快照/UI 阶段检查运行环境")
+    doctor_parser.add_argument(
+        "--phase",
+        choices=("auto", "source", "ui"),
+        default="auto",
+        help="auto 根据 Root 状态判断；source 要求 Root；ui 要求关闭 Root",
+    )
     inventory_parser = commands.add_parser("inventory", help="盘点健康卡片和 Root 数据源")
     inventory_parser.add_argument("--max-scrolls", type=int, default=12)
     snapshot_parser = commands.add_parser("snapshot-source", help="建立不可变 Root 数据库快照")
     snapshot_parser.add_argument("--no-restart-app", action="store_true")
+    key_parser = commands.add_parser("key-capture", help="短暂 Root 下只读截取 SQLCipher 密钥")
+    key_parser.add_argument("--timeout", type=int, default=45)
     collect_parser = commands.add_parser("collect", help="采集并规范化全部历史")
     _add_collect_arguments(collect_parser)
     run_parser = commands.add_parser("run", help="采集、校验并导出 CSV/XLSX")
@@ -518,6 +639,7 @@ def main() -> int:
         "doctor": doctor,
         "inventory": inventory,
         "snapshot-source": snapshot_source,
+        "key-capture": key_capture,
         "collect": collect,
         "run": run_all,
         "capture": capture_current,

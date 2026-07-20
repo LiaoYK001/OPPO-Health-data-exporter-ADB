@@ -341,6 +341,7 @@ class UiCollector:
                 checkpoint is not None
                 and checkpoint["last_date"] is not None
                 and day >= str(checkpoint["last_date"])
+                and current_date != dt.date.today()
             )
             try:
                 if already_done:

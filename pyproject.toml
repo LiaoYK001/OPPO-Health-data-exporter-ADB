@@ -13,6 +13,11 @@ dependencies = [
   "Pillow>=11.0",
 ]
 
+[project.optional-dependencies]
+frida = [
+  "frida>=17.9.11,<18",
+]
+
 [project.scripts]
 ohealth-exporter = "health_exporter.cli:main"
 

@@ -318,12 +318,24 @@ class Database:
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        savepoint: str | None = None
         try:
-            self.connection.execute("BEGIN")
+            if self.connection.in_transaction:
+                savepoint = f"nested_{uuid.uuid4().hex}"
+                self.connection.execute(f"SAVEPOINT {savepoint}")
+            else:
+                self.connection.execute("BEGIN")
             yield self.connection
-            self.connection.commit()
+            if savepoint is not None:
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                self.connection.commit()
         except Exception:
-            self.connection.rollback()
+            if savepoint is not None:
+                self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                self.connection.rollback()
             raise
 
     def ensure_source(

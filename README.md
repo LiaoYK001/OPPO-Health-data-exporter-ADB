@@ -1,27 +1,59 @@
-# OPPO Health data exporter (MuMu + ADB)
+# OPPO 健康全细节导出器（MuMu + ADB）
 
-这个项目用于从 MuMu 模拟器里的国内版欢太健康（`com.heytap.health`）保存个人可见健康数据。当前第一阶段已经实现环境检查、屏幕/UI 快照，以及心率详情页单日结构化探针。
+本项目采用两条采集通道：Root 阶段保存 OPPO 健康的数据库、WAL/SHM 和完整原始行；非 Root 阶段通过 ADB 遍历“健康”页及指标详情，保存逐屏 PNG、UI XML、长图、图表裁剪和页面文字。规范层统一写入 SQLite，并可重复导出日级 CSV/XLSX。
 
-## 立即开始
+> OPPO 健康 6.5.4 会检测 Root 并主动退出。不要长期保持 Root，也不要安装 Root 隐藏模块。采集必须分成两个阶段。
 
-前提：MuMu 12 已运行，欢太健康已登录并完成同步，MuMu 的“ADB 本地调试”已打开。
+## 当前环境
+
+- MuMu ADB：`127.0.0.1:7555`
+- 包名：`com.heytap.health`
+- 已验收版本：`6.5.4_48053ce_260715`
+- 显示基准：`1440×2560`、密度 `640`、中文、深色模式
+- 本地数据库：`data/health.sqlite3`
+- 原始快照和页面素材：`data/`（已从 Git 排除）
+
+## 两阶段操作
+
+### A. Root 源快照
+
+仅在需要新快照时开启 MuMu Root 并重启：
 
 ```powershell
-python .\ohealth_exporter.py doctor
+python .\ohealth_exporter.py doctor --phase source
+python .\ohealth_exporter.py snapshot-source
 ```
 
-保存当前页面现场（PNG、UI XML、可见文字）：
+风险提示后 APP 退出不影响 Root 文件复制。快照成功后立即关闭 Root，再重启 MuMu。
+
+### B. 非 Root 页面采集
+
+打开 OPPO 健康并停在“健康”首页：
 
 ```powershell
-python .\ohealth_exporter.py capture
+python .\ohealth_exporter.py doctor --phase ui
+python .\ohealth_exporter.py inventory
+python .\ohealth_exporter.py collect --ui-only --all-history --resume
 ```
 
-在欢太健康首页点击“心率”卡片，进入“日”视图后运行：
+中断后重复最后一条命令即可续跑；当天会重新采集并生成新版本。
+
+### 校验和表格
 
 ```powershell
-python .\ohealth_exporter.py probe-heart
+python .\ohealth_exporter.py verify
+python .\ohealth_exporter.py export --format both
 ```
 
-输出会写入 `output\`。该目录包含个人健康数据，已加入 `.gitignore`，不要提交到公开仓库。
+CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇总；日内采样点、睡眠阶段区间、原始 vendor 字段和页面证据保留在 SQLite/素材库中。
 
-完整实施顺序、人工操作节点和验收标准见 [document/MUMU_WORKFLOW.md](document/MUMU_WORKFLOW.md)。
+完整状态、故障处理和验收边界见 [MuMu 操作流程](document/MUMU_WORKFLOW.md)。
+
+## 开发验证
+
+```powershell
+python -m pytest
+python -m compileall -q health_exporter ohealth_exporter.py
+```
+
+健康数据、截图、UI XML、数据库快照和导出文件都属于敏感个人信息，不要上传到公开仓库、网盘或 issue。
