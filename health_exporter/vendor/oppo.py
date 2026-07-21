@@ -95,7 +95,6 @@ class OppoAdapter(VendorAdapter):
         manifest_dir.mkdir(parents=True, exist_ok=True)
         pulled: list[SnapshotFile] = []
         staged_views: list[tuple[str, Path, str]] = []
-        was_foreground = self.adb.foreground().startswith(PACKAGE + "/")
         self.adb.force_stop(PACKAGE)
         try:
             with tempfile.TemporaryDirectory(prefix="ohealth-root-snapshot-") as temp:
@@ -133,7 +132,7 @@ class OppoAdapter(VendorAdapter):
                         )
                     )
         finally:
-            if self.restart_app or was_foreground:
+            if self.restart_app:
                 self.adb.start_activity(MAIN_ACTIVITY)
 
         manifest = {

@@ -6,6 +6,7 @@
 
 ## 当前环境
 
+- MuMu：Android 15（SDK 35；同时兼容旧的 Android 12 ADB 路径）
 - MuMu ADB：`127.0.0.1:7555`
 - 包名：`com.heytap.health`
 - 已验收版本：`6.5.4_48053ce_260715`
@@ -17,14 +18,14 @@
 
 ### A. Root 源快照
 
-仅在需要新快照时开启 MuMu Root 并重启：
+仅在需要新快照时使用短暂 Root 窗口。先在非 Root 状态打开 APP 并完成同步，保持 APP 已打开，再热开启 MuMu Root；不要在 Root 状态下重新启动 APP：
 
 ```powershell
 python .\ohealth_exporter.py doctor --phase source
 python .\ohealth_exporter.py snapshot-source
 ```
 
-风险提示后 APP 退出不影响 Root 文件复制。快照成功后立即关闭 Root，再重启 MuMu。
+`snapshot-source` 会为一致性停止 APP，但默认不会在 Root 状态下重新启动。快照成功后立即关闭 Root，再手动打开 APP。只有已明确验证 Root 下可启动时，才使用显式的 `--restart-app`。
 
 ### B. 非 Root 页面采集
 
@@ -41,6 +42,7 @@ python .\ohealth_exporter.py collect --ui-only --all-history --resume
 ### 校验和表格
 
 ```powershell
+python .\ohealth_exporter.py repair-normalized
 python .\ohealth_exporter.py verify
 python .\ohealth_exporter.py export --format both
 ```

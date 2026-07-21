@@ -1,5 +1,7 @@
 # MuMu + ADB：OPPO 健康全细节导出流程
 
+当前已在 MuMu Android 15（SDK 35）、1440×2560、密度 640 上完成 ADB、首页盘点、日期后退和 checkpoint 续跑验收。采集器仍保留 MuMu Android 12 的 ADB 路径兼容。
+
 ## 1. 为什么开启 Root 后会“闪退”
 
 OPPO 健康 6.5.4 会主动检测 Root。检测到后显示风险提示，确认后结束应用进程；这不是 MuMu 崩溃，也不是健康数据损坏。req1 因此固定采用“两阶段采集”：
@@ -19,14 +21,14 @@ OPPO 健康 6.5.4 会主动检测 Root。检测到后显示风险提示，确认
 
 ## 3. 以后重新建立 Root 快照
 
-先在 OPPO 健康内完成同步，然后关闭 APP。打开 MuMu“设置中心 → 其他设置 → Root 权限”，保存并重启模拟器。
+先在 Root 关闭时打开 OPPO 健康并完成同步。保持 APP 已打开，在 MuMu 设置中热开启 Root；不要在 Root 状态下重新启动 APP。随后执行：
 
 ```powershell
 python .\ohealth_exporter.py doctor --phase source
 python .\ohealth_exporter.py snapshot-source
 ```
 
-硬性条件是 `adb shell su -c id` 返回 `uid=0`。`snapshot-source` 会先复制数据库和相邻 WAL/SHM，再检查副本，避免读取设备侧 SHM 时造成锁冲突。成功输出 manifest 后即可关闭 Root。
+硬性条件是 `adb shell su -c id` 返回 `uid=0`。`snapshot-source` 会先停止 APP 以冻结写入，再复制数据库和相邻 WAL/SHM，并检查副本；默认不会在 Root 状态下重新启动 APP。成功输出 manifest 后立即关闭 Root，再手动打开 APP。若确实需要恢复启动，可显式使用 `--restart-app`，但 OPPO 健康 6.5.4 通常会因 Root 检测而退出。
 
 若主库仍报告 SQLCipher 加密，则在同一次短暂 Root 窗口安装可选客户端并截取 APP 自己传给数据库的密钥：
 
@@ -39,10 +41,10 @@ python .\ohealth_exporter.py key-capture
 
 ## 4. 关闭 Root，恢复 APP 正常运行
 
-1. 完全关闭 MuMu；
-2. 在 MuMu 设置中心关闭 Root 权限，保存；
-3. 重新启动 MuMu；
-4. 打开 OPPO 健康，确认不再出现 Root 风险提示；
+1. 在 MuMu 设置中心关闭 Root 权限并保存；
+2. 确认 `adb shell su -c id` 不再返回 `uid=0`；
+3. 手动打开 OPPO 健康，确认不再出现 Root 风险提示；
+4. 如果热关闭未生效，再重启 MuMu，并保持 Root 关闭；
 5. 等待同步完成，切到底部“健康”页；
 6. 不改分辨率、密度、字体、语言或深浅色模式。
 
@@ -78,6 +80,16 @@ python .\ohealth_exporter.py collect --ui-only --metrics activity,heart_rate,sle
 python .\ohealth_exporter.py collect --ui-only --all-history --resume
 ```
 
+长时间采集应保持单一 UI 控制进程；不要同时启动两个 `collect`。如需把剩余指标排在正在运行的心率任务之后，可在隐藏窗口启动监督脚本：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\continue_after_heart.ps1 -HeartProcessId <心率采集PID>
+```
+
+监督脚本会在心率采集器异常退出时从 SQLite checkpoint 自动续跑，默认最多重试 3 次，并且不会重启 OPPO 健康。心率正常退出且 checkpoint 已到 SQLite 中该数据源的最早心率日期后，才会继续活动、睡眠、血氧、血压、体重和压力，并最终执行校验与 CSV/XLSX 导出；否则停止排队并记录原因。运行日志位于 `data/logs/`。
+
+如需人工停止无人值守任务，先创建 `data\STOP_UI_COLLECTION`，再结束采集器进程；监督脚本看到该标志后不会重新拉起采集器。恢复前删除该标志文件。
+
 每个“指标 × 日期”会保存：
 
 - 所有滚动视口的 PNG 和 UI XML；
@@ -88,6 +100,8 @@ python .\ohealth_exporter.py collect --ui-only --all-history --resume
 
 `Ctrl+C`、模拟器重启或 APP 被系统杀死后，重新执行同一命令即可从 checkpoint 续跑。历史完成日跳过；当天属于 `partial`，即使已有 checkpoint 也会重新采集并生成可追溯版本。
 
+使用 `--max-days N` 分批时，`N` 表示本批新采集或尝试的日期数；为了到达 checkpoint 而翻过的已完成日期不会消耗该额度。当日重抓也不会把已经推进到更早日期的历史 checkpoint 覆盖回今天。
+
 ## 7. 精确数据边界
 
 截图仅用于验真，不能根据柱高或折线位置反推数值并冒充精确值。图表的步数时间片、心率/血氧采样、睡眠阶段等必须来自解密后的原始数据库或 APP 数据服务。当前主库已确认加密，在密钥提取完成前，相应精细序列必须标记为阻断缺口，不能把 `visual_only` 当成语义完整。
@@ -97,9 +111,12 @@ Root 风险提示不会阻止已经完成的快照，但数据库密钥提取需
 ## 8. 导出和验收
 
 ```powershell
+python .\ohealth_exporter.py repair-normalized
 python .\ohealth_exporter.py verify
 python .\ohealth_exporter.py export --format both
 ```
+
+`repair-normalized` 只修正规范层中已审计确认的映射错误，并在 `normalization_corrections` 保存修正前值、修正后值和原因；不可变原始数据库、原始行版本和页面证据不会被修改。重复运行是幂等的。
 
 输出包括 `daily_overview.csv`、各指标日表 CSV、`coverage.csv` 和 `health_daily.xlsx`。SQLite 继续保留日内点位、阶段区间、原始行版本和证据关系。
 

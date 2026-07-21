@@ -29,6 +29,11 @@ from .db import Database
 from .errors import ExporterError, RootRequiredError, VersionMismatchError
 from .exporting import DailyExporter
 from .frida_bridge import capture_database_key
+from .normalization import (
+    repair_activity_normalization,
+    repair_sleep_intervals,
+    repair_weight_units,
+)
 from .ui import UiCollector, local_id, node_label
 from .vendor.base import SnapshotFile, SnapshotResult
 from .vendor.oppo import OppoAdapter
@@ -98,6 +103,10 @@ def doctor(args: argparse.Namespace) -> int:
     density = adb.shell("wm", "density")
     android = adb.shell("getprop", "ro.build.version.release")
     locale = adb.shell("getprop", "persist.sys.locale", check=False)
+    if not locale:
+        # Android 15 / MuMu 15 may leave persist.sys.locale empty while the
+        # effective locale is exposed through the read-only product property.
+        locale = adb.shell("getprop", "ro.product.locale", check=False)
     version = adb.package_version(PACKAGE)
     installed = PACKAGE in adb.shell("pm", "list", "packages", PACKAGE)
     foreground = adb.foreground()
@@ -224,7 +233,7 @@ def snapshot_source(args: argparse.Namespace) -> int:
             "snapshot-source",
             runtime.app_version,
             adb.serial,
-            {"restart_app": not args.no_restart_app},
+            {"restart_app": args.restart_app},
         )
         adapter = OppoAdapter(
             adb,
@@ -232,7 +241,7 @@ def snapshot_source(args: argparse.Namespace) -> int:
             runtime.artifacts,
             runtime.data_dir,
             runtime.app_version,
-            restart_app=not args.no_restart_app,
+            restart_app=args.restart_app,
         )
         try:
             result = adapter.snapshot(run_id)
@@ -491,6 +500,7 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                                 max_days=args.max_days,
                                 resume=args.resume,
                                 capture_subpages=not args.no_subpages,
+                                max_scrolls=args.max_scrolls,
                             )
                         ui_results.append(capture_result)
                         if capture_result["failures"] == 0 and capture_result["captured"] > 0:
@@ -607,6 +617,52 @@ def export_data(args: argparse.Namespace) -> int:
         return 0
 
 
+def repair_normalized(args: argparse.Namespace) -> int:
+    with Runtime(args, require_adb=False) as runtime:
+        source = (
+            runtime.db.connection.execute(
+                "SELECT * FROM sources WHERE id=?",
+                (args.source_id,),
+            ).fetchone()
+            if args.source_id is not None
+            else runtime.db.latest_source()
+        )
+        if source is None:
+            raise ExporterError("没有可修复的本地数据源。")
+        source_id = int(source["id"])
+        run_id = runtime.db.start_run(
+            source_id,
+            "repair-normalized",
+            str(source["app_version"]),
+            "offline",
+            {
+                "repairs": [
+                    "oppo_weight_grams_to_kg",
+                    "oppo_activity_aggregate_and_subunits",
+                    "oppo_sleep_consolidated_intervals",
+                    "coverage_best_fidelity_from_evidence",
+                ]
+            },
+        )
+        try:
+            result = repair_weight_units(runtime.db, source_id, run_id)
+            result.update(repair_activity_normalization(runtime.db, source_id, run_id))
+            result.update(repair_sleep_intervals(runtime.db, source_id, run_id))
+            result.update(runtime.db.repair_coverage_statuses(source_id))
+            runtime.db.finish_run(run_id, "complete")
+            json_print({"run_id": run_id, "source_id": source_id, **result})
+            return 0
+        except Exception as exc:
+            runtime.db.record_failure(
+                run_id,
+                "repair_normalized",
+                exc,
+                metric="weight",
+            )
+            runtime.db.finish_run(run_id, "failed", str(exc))
+            raise
+
+
 def verify_data(args: argparse.Namespace) -> int:
     with Runtime(args, require_adb=False) as runtime:
         report = Verifier(runtime.db, runtime.data_dir).verify(
@@ -665,7 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_parser = commands.add_parser("inventory", help="盘点健康卡片和 Root 数据源")
     inventory_parser.add_argument("--max-scrolls", type=int, default=12)
     snapshot_parser = commands.add_parser("snapshot-source", help="建立不可变 Root 数据库快照")
-    snapshot_parser.add_argument("--no-restart-app", action="store_true")
+    snapshot_parser.add_argument(
+        "--restart-app",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="快照后重新启动 APP；Root 开启时默认关闭，避免触发风险退出",
+    )
     key_parser = commands.add_parser("key-capture", help="短暂 Root 下只读截取 SQLCipher 密钥")
     key_parser.add_argument("--timeout", type=int, default=45)
     key_parser.add_argument(
@@ -689,6 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--format", choices=("csv", "xlsx", "both"), default="both")
     export_parser.add_argument("--source-id", type=int)
     export_parser.add_argument("--output-dir", type=Path)
+    repair_parser = commands.add_parser(
+        "repair-normalized",
+        help="从不可变原始层审计并修正规范层单位/派生字段",
+    )
+    repair_parser.add_argument("--source-id", type=int)
     verify_parser = commands.add_parser("verify", help="校验素材哈希和指标日期覆盖")
     verify_parser.add_argument("--source-id", type=int)
     verify_parser.add_argument("--fast", action="store_true", help="跳过全量 SHA-256 复算")
@@ -707,6 +773,7 @@ def main() -> int:
         "capture": capture_current,
         "probe-heart": probe_heart,
         "export": export_data,
+        "repair-normalized": repair_normalized,
         "verify": verify_data,
     }
     try:

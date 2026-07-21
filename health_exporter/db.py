@@ -15,7 +15,15 @@ from .constants import FIDELITY_VALUES
 from .errors import ExporterError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+COVERAGE_STATUS_PRIORITY = {
+    "failed": 0,
+    "visual_only": 1,
+    "no_data": 2,
+    "exact_ui": 3,
+    "exact_source": 4,
+}
 
 
 def utc_now() -> str:
@@ -254,6 +262,20 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     PRIMARY KEY(source_id, canonical_metric)
 );
 
+CREATE TABLE IF NOT EXISTS normalization_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES ingest_runs(id),
+    entity_table TEXT NOT NULL,
+    entity_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    before_json TEXT NOT NULL,
+    after_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(source_id, entity_table, entity_id, field, before_json, after_json)
+);
+
 CREATE INDEX IF NOT EXISTS idx_metric_records_day
 ON metric_records(source_id, canonical_metric, local_date);
 CREATE INDEX IF NOT EXISTS idx_samples_time
@@ -317,6 +339,34 @@ class Database:
                 (2, utc_now()),
             )
             self.connection.execute("PRAGMA user_version=2")
+            self.connection.commit()
+            current = 2
+        if current < 3:
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS normalization_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES ingest_runs(id),
+                    entity_table TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    field TEXT NOT NULL,
+                    before_json TEXT NOT NULL,
+                    after_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(
+                        source_id, entity_table, entity_id, field,
+                        before_json, after_json
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (3, utc_now()),
+            )
+            self.connection.execute("PRAGMA user_version=3")
             self.connection.commit()
 
     def _load_or_create_salt(self) -> bytes:
@@ -444,6 +494,38 @@ class Database:
             (status, utc_now(), error, run_id),
         )
         self.connection.commit()
+
+    def record_normalization_correction(
+        self,
+        *,
+        source_id: int,
+        run_id: str,
+        entity_table: str,
+        entity_id: int,
+        field: str,
+        before: Any,
+        after: Any,
+        reason: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO normalization_corrections(
+                source_id, run_id, entity_table, entity_id, field,
+                before_json, after_json, reason, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                source_id,
+                run_id,
+                entity_table,
+                entity_id,
+                field,
+                canonical_json(before),
+                canonical_json(after),
+                reason,
+                utc_now(),
+            ),
+        )
 
     def add_artifact(
         self,
@@ -802,6 +884,37 @@ class Database:
         detail: dict[str, Any],
         run_id: str,
     ) -> None:
+        existing = self.connection.execute(
+            """
+            SELECT status, detail_json FROM coverage
+            WHERE source_id=? AND canonical_metric=? AND local_date=?
+            """,
+            (source_id, metric, local_date),
+        ).fetchone()
+        merged_detail = dict(detail)
+        final_status = status
+        if existing is not None:
+            try:
+                previous_detail = json.loads(str(existing["detail_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous_detail = {}
+            if not isinstance(previous_detail, dict):
+                previous_detail = {}
+            merged_detail = {**previous_detail, **detail}
+            for evidence_kind in ("database", "ui"):
+                if evidence_kind in previous_detail or evidence_kind in detail:
+                    merged_detail[evidence_kind] = bool(
+                        previous_detail.get(evidence_kind)
+                        or detail.get(evidence_kind)
+                    )
+            final_status = max(
+                (str(existing["status"]), status),
+                key=lambda value: COVERAGE_STATUS_PRIORITY.get(value, -1),
+            )
+        if merged_detail.get("database"):
+            final_status = "exact_source"
+        elif merged_detail.get("ui"):
+            final_status = "exact_ui"
         self.connection.execute(
             """
             INSERT INTO coverage(
@@ -818,12 +931,45 @@ class Database:
                 source_id,
                 metric,
                 local_date,
-                status,
-                canonical_json(detail),
+                final_status,
+                canonical_json(merged_detail),
                 run_id,
                 utc_now(),
             ),
         )
+
+    def repair_coverage_statuses(self, source_id: int) -> dict[str, int]:
+        """Restore best-fidelity status from independently merged evidence flags."""
+
+        rows = self.connection.execute(
+            """
+            SELECT id, status, detail_json FROM coverage
+            WHERE source_id=? ORDER BY id
+            """,
+            (source_id,),
+        ).fetchall()
+        repaired = 0
+        with self.transaction():
+            for row in rows:
+                try:
+                    detail = json.loads(str(row["detail_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(detail, dict):
+                    continue
+                desired = str(row["status"])
+                if detail.get("database"):
+                    desired = "exact_source"
+                elif detail.get("ui"):
+                    desired = "exact_ui"
+                if desired == row["status"]:
+                    continue
+                self.connection.execute(
+                    "UPDATE coverage SET status=?, updated_at=? WHERE id=?",
+                    (desired, utc_now(), int(row["id"])),
+                )
+                repaired += 1
+        return {"coverage_statuses_repaired": repaired}
 
     def reconcile_no_data_coverage(
         self,

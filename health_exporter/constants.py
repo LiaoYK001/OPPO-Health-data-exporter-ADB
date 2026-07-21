@@ -49,6 +49,7 @@ class MetricUiProfile:
     date_ids: tuple[str, ...]
     previous_ids: tuple[str, ...] = ("iv_pre", "iv_last")
     subpage_titles: tuple[str, ...] = ()
+    fallback_previous_x_ratio: float | None = None
 
 
 UI_PROFILES = {
@@ -57,7 +58,6 @@ UI_PROFILES = {
         home_titles=("每日活动", "步数", "消耗"),
         page_titles=("每日活动",),
         date_ids=("tv_daily_date",),
-        subpage_titles=("步数", "活动消耗", "锻炼时长", "活动次数"),
     ),
     "heart_rate": MetricUiProfile(
         metric="heart_rate",
@@ -89,6 +89,7 @@ UI_PROFILES = {
         home_titles=("体重",),
         page_titles=("体重", "公斤"),
         date_ids=("tv_date", "weight_date"),
+        fallback_previous_x_ratio=1 / 12,
     ),
     "stress": MetricUiProfile(
         metric="stress",

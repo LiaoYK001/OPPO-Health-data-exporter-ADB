@@ -17,6 +17,7 @@ def find_adb(explicit: str | None = None) -> Path:
         explicit,
         os.environ.get("ADB_PATH"),
         shutil.which("adb"),
+        r"C:\Program Files\Netease\MuMu\nx_device\15.0\shell\adb.exe",
         r"C:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe",
         r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
     ]

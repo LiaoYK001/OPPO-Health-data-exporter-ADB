@@ -55,6 +55,16 @@ def center(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def canvas_previous_point(
+    date_bounds: tuple[int, int, int, int],
+    screen_width: int,
+    x_ratio: float,
+) -> tuple[int, int]:
+    """Return the evidence-derived center of a custom-drawn previous arrow."""
+
+    return round(screen_width * x_ratio), date_bounds[3]
+
+
 def date_from_label(label: str, reference: dt.date) -> dt.date | None:
     match = DATE_PATTERN.search(label)
     if not match:
@@ -72,6 +82,24 @@ def date_from_label(label: str, reference: dt.date) -> dt.date | None:
         except ValueError:
             pass
     return min(candidates, key=lambda item: abs((item - reference).days)) if candidates else None
+
+
+def advance_checkpoint_date(
+    existing: dt.date | None,
+    captured: dt.date,
+    today: dt.date,
+) -> tuple[dt.date, bool]:
+    """Keep a descending-history checkpoint monotonic toward older dates.
+
+    The current day is intentionally re-captured because it is partial, but it
+    must not replace an older resume boundary and cause completed history to be
+    traversed again after a restart.
+    """
+
+    if existing is not None and captured == today:
+        return existing, False
+    candidate = captured if existing is None else min(existing, captured)
+    return candidate, candidate != existing
 
 
 @dataclass
@@ -148,16 +176,20 @@ class UiTree:
             )
         return payload
 
-    def date_label(self, profile: MetricUiProfile | None = None) -> str | None:
+    def date_node(self, profile: MetricUiProfile | None = None) -> ET.Element | None:
         if profile:
             node = self.by_id(*profile.date_ids)
-            if node and node_label(node):
-                return node_label(node)
+            if node is not None and node_label(node):
+                return node
         for node in self.nodes:
             label = node_label(node)
             if DATE_PATTERN.search(label):
-                return label
+                return node
         return None
+
+    def date_label(self, profile: MetricUiProfile | None = None) -> str | None:
+        node = self.date_node(profile)
+        return node_label(node) if node is not None else None
 
 
 @dataclass(frozen=True)
@@ -272,6 +304,9 @@ class UiCollector:
         if metric not in UI_PROFILES:
             raise ExporterError(f"未知 UI 指标：{metric}")
         profile = UI_PROFILES[metric]
+        current = self._reuse_current_metric_page(metric, profile)
+        if current is not None:
+            return current
         self._ensure_home()
         self.dismiss_known_popups()
         self._scroll_to_top()
@@ -318,6 +353,34 @@ class UiCollector:
                 time.sleep(0.6)
         raise ExporterError(f"健康首页未找到指标卡：{metric}")
 
+    def _reuse_current_metric_page(
+        self,
+        metric: str,
+        profile: MetricUiProfile,
+    ) -> UiTree | None:
+        foreground = self.adb.foreground()
+        if not foreground.startswith(PACKAGE + "/") or foreground.endswith(
+            "/com.heytap.health.main.MainActivity"
+        ):
+            return None
+        with tempfile.TemporaryDirectory(prefix=f"ohealth-reuse-{metric}-") as temp:
+            tree, _ = self.dump_tree(Path(temp), "current")
+        if tree.date_label(profile) is None:
+            return None
+        day_tab_selected = any(
+            node_label(node) == "日" and node.attrib.get("selected") == "true"
+            for node in tree.nodes
+        )
+        if not day_tab_selected:
+            return None
+        if metric == "weight" and foreground.endswith(
+            "/com.heytap.health.bodyfat.ui.BodyFatDetailsActivity"
+        ):
+            return tree
+        if any(tree.by_text(title) is not None for title in profile.page_titles):
+            return tree
+        return None
+
     def capture_history(
         self,
         metric: str,
@@ -326,6 +389,7 @@ class UiCollector:
         max_days: int | None = None,
         resume: bool = True,
         capture_subpages: bool = True,
+        max_scrolls: int = 12,
     ) -> dict[str, Any]:
         profile = UI_PROFILES[metric]
         tree = self.enter_metric(metric)
@@ -335,27 +399,57 @@ class UiCollector:
         current_date = date_from_label(label, dt.date.today())
         if current_date is None:
             raise ExporterError(f"无法解析 {metric} 页面日期：{label}")
-        captured = skipped = failures = 0
+        today = dt.date.today()
+        checkpoint = self.db.get_checkpoint(self.source_id, metric) if resume else None
+        checkpoint_date: dt.date | None = None
+        if checkpoint is not None and checkpoint["last_date"]:
+            try:
+                checkpoint_date = dt.date.fromisoformat(str(checkpoint["last_date"]))
+            except ValueError as exc:
+                raise ExporterError(
+                    f"{metric} checkpoint 日期无效：{checkpoint['last_date']}"
+                ) from exc
+        if (
+            checkpoint_date is not None
+            and current_date > checkpoint_date
+            and (current_date - checkpoint_date).days >= 3
+        ):
+            current_date = self._resume_to_checkpoint(
+                profile,
+                current_date,
+                checkpoint_date,
+            )
+        captured = skipped = failures = attempted = 0
         visited = 0
         while current_date >= earliest_date:
-            if max_days is not None and visited >= max_days:
+            if max_days is not None and attempted >= max_days:
                 break
             visited += 1
             day = current_date.isoformat()
-            checkpoint = self.db.get_checkpoint(self.source_id, metric) if resume else None
             already_done = (
-                checkpoint is not None
-                and checkpoint["last_date"] is not None
-                and day >= str(checkpoint["last_date"])
-                and current_date != dt.date.today()
+                checkpoint_date is not None
+                and current_date >= checkpoint_date
+                and current_date != today
             )
             try:
                 if already_done:
                     skipped += 1
                 else:
-                    self.capture_page(metric, day, metric)
+                    attempted += 1
+                    main_capture_id = self.capture_page(
+                        metric,
+                        day,
+                        metric,
+                        max_scrolls=max_scrolls,
+                    )
                     if capture_subpages:
-                        self._capture_subpages(metric, day, profile)
+                        self._capture_subpages(
+                            metric,
+                            day,
+                            profile,
+                            main_capture_id=main_capture_id,
+                            max_scrolls=max_scrolls,
+                        )
                     self.db.set_coverage(
                         self.source_id,
                         metric,
@@ -364,12 +458,19 @@ class UiCollector:
                         {"database": self._has_source_day(metric, day), "ui": True},
                         self.run_id,
                     )
-                    self.db.set_checkpoint(
-                        self.source_id,
-                        metric,
-                        day,
-                        {"page_date": day, "status": "captured"},
+                    next_checkpoint, moved = advance_checkpoint_date(
+                        checkpoint_date,
+                        current_date,
+                        today,
                     )
+                    if moved:
+                        self.db.set_checkpoint(
+                            self.source_id,
+                            metric,
+                            next_checkpoint.isoformat(),
+                            {"page_date": day, "status": "captured"},
+                        )
+                        checkpoint_date = next_checkpoint
                     self.db.connection.commit()
                     captured += 1
             except Exception as exc:
@@ -390,11 +491,12 @@ class UiCollector:
                     self.run_id,
                 )
                 self.db.connection.commit()
-            if max_days is not None and visited >= max_days:
+            if max_days is not None and attempted >= max_days:
                 break
             if current_date == earliest_date:
                 break
-            if not self._go_previous_day(profile, current_date):
+            previous_date = self._go_previous_day(profile, current_date)
+            if previous_date is None:
                 self.db.record_failure(
                     self.run_id,
                     "date_navigation",
@@ -404,12 +506,13 @@ class UiCollector:
                 )
                 failures += 1
                 break
-            current_date -= dt.timedelta(days=1)
+            current_date = previous_date
         return {
             "metric": metric,
             "captured": captured,
             "skipped": skipped,
             "failures": failures,
+            "attempted": attempted,
             "visited": visited,
         }
 
@@ -420,13 +523,20 @@ class UiCollector:
         page_key: str,
         max_scrolls: int = 12,
     ) -> int:
-        self._scroll_to_top(max_swipes=8)
+        initial_view = self._scroll_to_top(max_swipes=8)
         evidences: list[ViewportEvidence] = []
         seen: set[str] = set()
         with tempfile.TemporaryDirectory(prefix=f"ohealth-page-{metric}-") as temp:
             temp_root = Path(temp)
             for index in range(max_scrolls):
-                tree, xml_path = self.dump_tree(temp_root, f"viewport-{index:02d}")
+                if index == 0 and initial_view is not None:
+                    tree, xml_bytes = initial_view
+                    xml_path = temp_root / f"viewport-{index:02d}.xml"
+                    xml_path.write_bytes(xml_bytes)
+                else:
+                    tree, xml_path = self.dump_tree(
+                        temp_root, f"viewport-{index:02d}"
+                    )
                 screenshot_path = self.screenshot(temp_root, f"viewport-{index:02d}")
                 payload = tree.visible_payload()
                 fingerprint = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
@@ -515,22 +625,67 @@ class UiCollector:
         metric: str,
         local_date: str,
         profile: MetricUiProfile,
+        main_capture_id: int,
+        max_scrolls: int = 12,
     ) -> None:
+        visible_titles = self._visible_subpage_titles(main_capture_id, profile)
         for title in profile.subpage_titles:
+            if title not in visible_titles:
+                continue
             if not self._open_text_target(title):
                 continue
             time.sleep(0.9)
             try:
-                self.capture_page(metric, local_date, f"{metric}/{title}")
+                self.capture_page(
+                    metric,
+                    local_date,
+                    f"{metric}/{title}",
+                    max_scrolls=max_scrolls,
+                )
             finally:
                 self.adb.keyevent("BACK")
                 time.sleep(0.8)
 
+    def _visible_subpage_titles(
+        self,
+        main_capture_id: int,
+        profile: MetricUiProfile,
+    ) -> set[str]:
+        row = self.db.connection.execute(
+            "SELECT display_payload_json FROM page_captures WHERE id=?",
+            (main_capture_id,),
+        ).fetchone()
+        if row is None:
+            raise ExporterError(f"主页面采集记录不存在：{main_capture_id}")
+        payload = json.loads(row["display_payload_json"])
+        expected = set(profile.subpage_titles)
+        visible: set[str] = set()
+        for viewport in payload.get("viewports", []):
+            if not isinstance(viewport, dict):
+                continue
+            for node in viewport.get("nodes", []):
+                if not isinstance(node, dict):
+                    continue
+                label = str(node.get("text") or node.get("content_desc") or "").strip()
+                if label in expected:
+                    visible.add(label)
+        return visible
+
     def _open_text_target(self, title: str, max_scrolls: int = 10) -> bool:
-        self._scroll_to_top(max_swipes=8)
+        initial_view = self._scroll_to_top(max_swipes=8)
+        seen: set[str] = set()
         with tempfile.TemporaryDirectory(prefix="ohealth-find-subpage-") as temp:
             for index in range(max_scrolls):
-                tree, _ = self.dump_tree(Path(temp), f"find-{index:02d}")
+                if index == 0 and initial_view is not None:
+                    tree = initial_view[0]
+                else:
+                    tree, _ = self.dump_tree(Path(temp), f"find-{index:02d}")
+                fingerprint = hashlib.sha256(
+                    canonical_json(tree.visible_payload()).encode()
+                ).hexdigest()
+                if fingerprint in seen:
+                    return False
+                seen.add(fingerprint)
                 node = tree.by_text(title)
                 target = tree.clickable_ancestor(node) if node is not None else None
                 if target is not None:
@@ -544,25 +699,21 @@ class UiCollector:
                 time.sleep(0.5)
         return False
 
-    def _go_previous_day(self, profile: MetricUiProfile, current: dt.date) -> bool:
-        self._scroll_to_top(max_swipes=8)
+    def _go_previous_day(
+        self,
+        profile: MetricUiProfile,
+        current: dt.date,
+    ) -> dt.date | None:
+        initial_view = self._scroll_to_top(max_swipes=8)
         with tempfile.TemporaryDirectory(prefix="ohealth-date-nav-") as temp:
-            tree, _ = self.dump_tree(Path(temp), "before")
-            previous = tree.by_id(*profile.previous_ids)
-            if previous is None:
-                date_node = tree.by_id(*profile.date_ids)
-                date_bounds = parse_bounds(date_node.attrib.get("bounds", "")) if date_node is not None else None
-                if date_bounds:
-                    candidates = []
-                    for node in tree.nodes:
-                        bounds = parse_bounds(node.attrib.get("bounds", ""))
-                        if node.attrib.get("clickable") == "true" and bounds and bounds[2] <= date_bounds[0]:
-                            candidates.append((bounds[2], node))
-                    previous = max(candidates, default=(0, None), key=lambda item: item[0])[1]
-            bounds = parse_bounds(previous.attrib.get("bounds", "")) if previous is not None else None
-            if not bounds:
-                return False
-            self.adb.tap(*center(bounds))
+            if initial_view is not None:
+                tree = initial_view[0]
+            else:
+                tree, _ = self.dump_tree(Path(temp), "before")
+            point = self._previous_tap_point(tree, profile)
+            if point is None:
+                return None
+            self.adb.tap(*point)
             deadline = time.time() + 10
             while time.time() < deadline:
                 time.sleep(0.5)
@@ -570,8 +721,102 @@ class UiCollector:
                 label = updated.date_label(profile)
                 parsed = date_from_label(label or "", current - dt.timedelta(days=1))
                 if parsed and parsed != current:
-                    return True
-        return False
+                    return parsed
+        return None
+
+    def _resume_to_checkpoint(
+        self,
+        profile: MetricUiProfile,
+        current: dt.date,
+        checkpoint: dt.date,
+        *,
+        batch_size: int = 5,
+        tap_delay: float = 0.35,
+    ) -> dt.date:
+        """Quickly cross dates already proven complete by a resume checkpoint.
+
+        Every small click batch is verified from the actual UI date. If the page
+        does not advance, the caller resumes the slower per-day navigation path.
+        """
+        with tempfile.TemporaryDirectory(prefix="ohealth-resume-nav-") as temp:
+            temp_root = Path(temp)
+            rounds = 0
+            while current > checkpoint:
+                rounds += 1
+                if rounds > 1000:
+                    return current
+                initial_view = self._scroll_to_top(max_swipes=8)
+                if initial_view is not None:
+                    tree = initial_view[0]
+                else:
+                    tree, _ = self.dump_tree(temp_root, f"before-{rounds:03d}")
+                point = self._previous_tap_point(tree, profile)
+                if point is None:
+                    return current
+                requested = min(batch_size, (current - checkpoint).days)
+                for _ in range(requested):
+                    self.adb.tap(*point)
+                    if tap_delay:
+                        time.sleep(tap_delay)
+                time.sleep(0.5)
+                updated, _ = self.dump_tree(temp_root, f"after-{rounds:03d}")
+                label = updated.date_label(profile)
+                parsed = date_from_label(label or "", current - dt.timedelta(days=requested))
+                if parsed is None or parsed >= current:
+                    return current
+                if parsed < checkpoint:
+                    raise ExporterError(
+                        f"续跑日期越过检查点：{parsed} < {checkpoint}"
+                    )
+                current = parsed
+        return current
+
+    @staticmethod
+    def _previous_tap_point(
+        tree: UiTree,
+        profile: MetricUiProfile,
+    ) -> tuple[int, int] | None:
+        previous = tree.by_id(*profile.previous_ids)
+        date_node = tree.date_node(profile)
+        date_bounds = (
+            parse_bounds(date_node.attrib.get("bounds", ""))
+            if date_node is not None
+            else None
+        )
+        if previous is None and date_bounds:
+            candidates = []
+            for node in tree.nodes:
+                bounds = parse_bounds(node.attrib.get("bounds", ""))
+                if (
+                    node.attrib.get("clickable") == "true"
+                    and bounds
+                    and bounds[2] <= date_bounds[0]
+                ):
+                    candidates.append((bounds[2], node))
+            previous = max(candidates, default=(0, None), key=lambda item: item[0])[1]
+        bounds = (
+            parse_bounds(previous.attrib.get("bounds", ""))
+            if previous is not None
+            else None
+        )
+        if bounds:
+            return center(bounds)
+        if date_bounds and profile.fallback_previous_x_ratio is not None:
+            screen_width = max(
+                (
+                    node_bounds[2]
+                    for node in tree.nodes
+                    if (node_bounds := parse_bounds(node.attrib.get("bounds", "")))
+                ),
+                default=0,
+            )
+            if screen_width > 0:
+                return canvas_previous_point(
+                    date_bounds,
+                    screen_width,
+                    profile.fallback_previous_x_ratio,
+                )
+        return None
 
     def _select_day_tab(self, tree: UiTree) -> None:
         node = tree.by_text("日")
@@ -625,21 +870,26 @@ class UiCollector:
         if not foreground.endswith(main_suffix):
             raise ExporterError(f"无法复位到 OPPO 健康首页，当前前台：{foreground}")
 
-    def _scroll_to_top(self, max_swipes: int = 12) -> None:
+    def _scroll_to_top(
+        self, max_swipes: int = 12
+    ) -> tuple[UiTree, bytes] | None:
         self.adb.shell("cmd", "statusbar", "collapse", check=False)
         with tempfile.TemporaryDirectory(prefix="ohealth-scroll-top-") as temp:
             previous: str | None = None
+            latest: tuple[UiTree, bytes] | None = None
             for index in range(max_swipes):
-                tree, _ = self.dump_tree(Path(temp), f"top-{index}")
+                tree, xml_path = self.dump_tree(Path(temp), f"top-{index}")
+                latest = (tree, xml_path.read_bytes())
                 payload = tree.visible_payload()
                 fingerprint = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
                 if fingerprint == previous:
-                    break
+                    return latest
                 previous = fingerprint
                 scrollable = tree.scrollable()
                 if scrollable is None or not self._swipe_scrollable(scrollable, down=True):
-                    break
+                    return latest
                 time.sleep(0.25)
+            return latest
 
     def _swipe_scrollable(self, node: ET.Element, *, down: bool) -> bool:
         bounds = parse_bounds(node.attrib.get("bounds", ""))
