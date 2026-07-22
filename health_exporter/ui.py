@@ -25,6 +25,7 @@ from .constants import (
 )
 from .db import Database, canonical_json
 from .errors import ExporterError
+from .operation_log import EVENT_LOG_NAME, OperationLogger
 
 
 REMOTE_XML = "/sdcard/ohealth-exporter-window.xml"
@@ -318,6 +319,21 @@ class UiCollector:
         self.run_id = run_id
         self.app_version = app_version
         self.display_profile = display_profile
+        self.operation_logger = OperationLogger(
+            artifacts.data_dir / "logs" / EVENT_LOG_NAME,
+            run_id,
+        )
+
+    def _event(
+        self,
+        level: str,
+        event: str,
+        message: str,
+        **context: Any,
+    ) -> None:
+        logger = getattr(self, "operation_logger", None)
+        if logger is not None:
+            logger.log(level, event, message, **context)
 
     def dump_tree(self, directory: Path, stem: str) -> tuple[UiTree, Path]:
         directory.mkdir(parents=True, exist_ok=True)
@@ -404,7 +420,26 @@ class UiCollector:
         profile = UI_PROFILES[metric]
         current = self._reuse_current_metric_page(metric, profile)
         if current is not None:
+            self._event(
+                "INFO",
+                "navigation.reuse_page",
+                "当前已经位于目标指标日详情页，直接复用",
+                metric=metric,
+                page=metric,
+                activity=self.adb.foreground(),
+                action="reuse_current_page",
+                status="complete",
+            )
             return current
+        self._event(
+            "INFO",
+            "navigation.home",
+            "返回健康首页并查找指标卡片",
+            metric=metric,
+            page="health_home",
+            action="find_metric_card",
+            status="started",
+        )
         self._ensure_home()
         self.dismiss_known_popups()
         self._scroll_to_top()
@@ -430,6 +465,17 @@ class UiCollector:
                 if target is not None:
                     bounds = parse_bounds(target.attrib.get("bounds", ""))
                     if bounds:
+                        self._event(
+                            "INFO",
+                            "navigation.tap_metric",
+                            f"在首页第 {index + 1} 个视口点击指标卡片",
+                            metric=metric,
+                            page="health_home",
+                            activity=self.adb.foreground(),
+                            action="tap",
+                            status="started",
+                            details={"viewport": index, "bounds": bounds},
+                        )
                         self.adb.tap(*center(bounds))
                         time.sleep(1.5)
                         detail, _ = self.dump_tree(Path(temp), "detail")
@@ -443,12 +489,52 @@ class UiCollector:
                             detail.by_text(title) is not None for title in profile.page_titles
                         ):
                             self._select_day_tab(detail)
+                            self._event(
+                                "INFO",
+                                "navigation.metric_opened",
+                                "已进入指标详情页并确认日视图",
+                                metric=metric,
+                                page=metric,
+                                activity=self.adb.foreground(),
+                                action="open_metric_detail",
+                                status="complete",
+                            )
                             return detail
+                        self._event(
+                            "ERROR",
+                            "navigation.unexpected_page",
+                            "点击指标卡后没有进入预期详情页",
+                            metric=metric,
+                            page=metric,
+                            activity=self.adb.foreground(),
+                            action="verify_metric_detail",
+                            status="failed",
+                        )
                         raise ExporterError(f"点击 {metric} 后未进入预期详情页。")
                 scrollable = tree.scrollable()
                 if scrollable is None or not self._swipe_scrollable(scrollable, down=False):
                     break
+                self._event(
+                    "DEBUG",
+                    "navigation.home_scroll",
+                    f"首页未找到目标，向下滚动到视口 {index + 2}",
+                    metric=metric,
+                    page="health_home",
+                    action="swipe_up",
+                    status="complete",
+                    details={"viewport": index + 1},
+                )
                 time.sleep(0.6)
+        self._event(
+            "ERROR",
+            "navigation.metric_missing",
+            "遍历健康首页后仍未找到指标卡",
+            metric=metric,
+            page="health_home",
+            action="find_metric_card",
+            status="failed",
+            details={"max_scrolls": max_scrolls},
+        )
         raise ExporterError(f"健康首页未找到指标卡：{metric}")
 
     def _reuse_current_metric_page(
@@ -490,12 +576,46 @@ class UiCollector:
         max_scrolls: int = 12,
     ) -> dict[str, Any]:
         profile = UI_PROFILES[metric]
+        self._event(
+            "INFO",
+            "history.start",
+            f"开始遍历 {profile.metric} 历史页面",
+            metric=metric,
+            page=metric,
+            action="enter_metric",
+            status="started",
+            details={
+                "earliest_date": earliest_date.isoformat(),
+                "max_days": max_days,
+                "resume": resume,
+                "capture_subpages": capture_subpages,
+            },
+        )
         tree = self.enter_metric(metric)
         label = tree.date_label(profile)
         if not label:
+            self._event(
+                "ERROR",
+                "page.date_missing",
+                "指标详情页没有可识别日期",
+                metric=metric,
+                page=metric,
+                action="read_date",
+                status="failed",
+            )
             raise ExporterError(f"{metric} 页面没有可识别日期。")
         current_date = date_from_label(label, dt.date.today())
         if current_date is None:
+            self._event(
+                "ERROR",
+                "page.date_parse_failed",
+                f"无法解析页面日期：{label}",
+                metric=metric,
+                page=metric,
+                action="parse_date",
+                status="failed",
+                details={"ui_label": label},
+            )
             raise ExporterError(f"无法解析 {metric} 页面日期：{label}")
         today = dt.date.today()
         checkpoint = self.db.get_checkpoint(self.source_id, metric) if resume else None
@@ -507,6 +627,18 @@ class UiCollector:
                 raise ExporterError(
                     f"{metric} checkpoint 日期无效：{checkpoint['last_date']}"
                 ) from exc
+        self._event(
+            "INFO",
+            "history.position",
+            f"当前页面日期 {current_date.isoformat()}，checkpoint "
+            f"{checkpoint_date.isoformat() if checkpoint_date else '无'}",
+            metric=metric,
+            local_date=current_date.isoformat(),
+            page=metric,
+            action="read_checkpoint",
+            status="ready",
+            details={"ui_label": label, "checkpoint": checkpoint_date},
+        )
         if (
             checkpoint_date is not None
             and current_date > checkpoint_date
@@ -516,6 +648,17 @@ class UiCollector:
             if calendar_date is not None:
                 current_date = calendar_date
             else:
+                self._event(
+                    "WARNING",
+                    "calendar.fallback",
+                    "日历直达未完成，改用逐日批量翻页",
+                    metric=metric,
+                    local_date=current_date.isoformat(),
+                    page=metric,
+                    action="resume_previous_day_batches",
+                    status="fallback",
+                    details={"checkpoint": checkpoint_date},
+                )
                 current_date = self._resume_to_checkpoint(
                     profile,
                     current_date,
@@ -533,11 +676,32 @@ class UiCollector:
                 and current_date >= checkpoint_date
                 and current_date != today
             )
+            self._event(
+                "INFO",
+                "day.begin",
+                f"处理日期 {day}" + ("（已有 checkpoint，将跳过）" if already_done else ""),
+                metric=metric,
+                local_date=day,
+                page=metric,
+                action="evaluate_day",
+                status="skipped" if already_done else "started",
+                details={"visited": visited, "attempted": attempted},
+            )
             try:
                 if already_done:
                     skipped += 1
                 else:
                     attempted += 1
+                    self._event(
+                        "INFO",
+                        "page.capture_start",
+                        "开始采集主详情页全部滚动区域",
+                        metric=metric,
+                        local_date=day,
+                        page=metric,
+                        action="capture_page",
+                        status="started",
+                    )
                     main_capture_id = self.capture_page(
                         metric,
                         day,
@@ -585,6 +749,21 @@ class UiCollector:
                         checkpoint_date = next_checkpoint
                     self.db.connection.commit()
                     captured += 1
+                    self._event(
+                        "INFO",
+                        "day.complete",
+                        f"日期 {day} 已完整提交，capture_id={main_capture_id}",
+                        metric=metric,
+                        local_date=day,
+                        page=metric,
+                        action="commit_day",
+                        status="complete",
+                        details={
+                            "capture_id": main_capture_id,
+                            "has_source_day": has_source_day,
+                            "checkpoint": checkpoint_date,
+                        },
+                    )
             except Exception as exc:
                 failures += 1
                 self.db.record_failure(
@@ -603,6 +782,17 @@ class UiCollector:
                     self.run_id,
                 )
                 self.db.connection.commit()
+                self._event(
+                    "ERROR",
+                    "day.failed",
+                    str(exc),
+                    metric=metric,
+                    local_date=day,
+                    page=metric,
+                    action="capture_day",
+                    status="failed",
+                    details={"exception_type": type(exc).__name__},
+                )
             if max_days is not None and attempted >= max_days:
                 break
             if current_date == earliest_date:
@@ -617,8 +807,44 @@ class UiCollector:
                     local_date=day,
                 )
                 failures += 1
+                self._event(
+                    "WARNING",
+                    "navigation.date_unchanged",
+                    "点击上一天后日期没有变化，停止当前指标",
+                    metric=metric,
+                    local_date=day,
+                    page=metric,
+                    action="go_previous_day",
+                    status="blocked",
+                )
                 break
+            self._event(
+                "INFO",
+                "navigation.previous_day",
+                f"已从 {current_date.isoformat()} 切换到 {previous_date.isoformat()}",
+                metric=metric,
+                local_date=previous_date.isoformat(),
+                page=metric,
+                action="go_previous_day",
+                status="complete",
+            )
             current_date = previous_date
+        self._event(
+            "INFO" if failures == 0 else "WARNING",
+            "history.complete",
+            f"{profile.metric} 本轮结束：采集 {captured}，跳过 {skipped}，失败 {failures}",
+            metric=metric,
+            page=metric,
+            action="capture_history",
+            status="complete" if failures == 0 else "completed_with_warnings",
+            details={
+                "captured": captured,
+                "skipped": skipped,
+                "failures": failures,
+                "attempted": attempted,
+                "visited": visited,
+            },
+        )
         return {
             "metric": metric,
             "captured": captured,
@@ -635,6 +861,18 @@ class UiCollector:
         page_key: str,
         max_scrolls: int = 12,
     ) -> int:
+        activity = self.adb.foreground()
+        self._event(
+            "INFO",
+            "page.scroll_top",
+            "将页面恢复到顶部，准备逐屏采集",
+            metric=metric,
+            local_date=local_date,
+            page=page_key,
+            activity=activity,
+            action="scroll_to_top",
+            status="started",
+        )
         initial_view = self._scroll_to_top(max_swipes=8)
         evidences: list[ViewportEvidence] = []
         seen: set[str] = set()
@@ -652,6 +890,18 @@ class UiCollector:
                 payload = tree.visible_payload()
                 fingerprint = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
                 if fingerprint in seen:
+                    self._event(
+                        "DEBUG",
+                        "viewport.repeat",
+                        f"视口 {index + 1} 与已有内容重复，确认到达页面底部",
+                        metric=metric,
+                        local_date=local_date,
+                        page=page_key,
+                        activity=activity,
+                        action="compare_viewport",
+                        status="complete",
+                        details={"viewport": index},
+                    )
                     break
                 seen.add(fingerprint)
                 # Only take the relatively expensive PNG after proving this
@@ -677,8 +927,51 @@ class UiCollector:
                         tuple(chart_artifacts),
                     )
                 )
+                self._event(
+                    "INFO",
+                    "viewport.captured",
+                    f"已保存第 {index + 1} 个视口的 PNG、XML"
+                    f"及 {len(chart_artifacts)} 个图表裁剪",
+                    metric=metric,
+                    local_date=local_date,
+                    page=page_key,
+                    activity=activity,
+                    action="capture_viewport",
+                    status="complete",
+                    details={
+                        "viewport": index,
+                        "visible_nodes": len(payload),
+                        "screenshot_sha256": screenshot_artifact.sha256,
+                        "xml_sha256": xml_artifact.sha256,
+                        "chart_count": len(chart_artifacts),
+                    },
+                )
                 if scrollable is None or not self._swipe_scrollable(scrollable, down=False):
+                    self._event(
+                        "DEBUG",
+                        "page.bottom",
+                        "当前视口没有可继续滚动的区域，结束本页采集",
+                        metric=metric,
+                        local_date=local_date,
+                        page=page_key,
+                        activity=activity,
+                        action="detect_page_bottom",
+                        status="complete",
+                        details={"viewport": index},
+                    )
                     break
+                self._event(
+                    "INFO",
+                    "viewport.scroll",
+                    f"向下滚动，准备读取第 {index + 2} 个视口",
+                    metric=metric,
+                    local_date=local_date,
+                    page=page_key,
+                    activity=activity,
+                    action="swipe_up",
+                    status="complete",
+                    details={"from_viewport": index, "to_viewport": index + 1},
+                )
                 time.sleep(0.6)
             mosaic_path = temp_root / "page-mosaic.png"
             self._build_mosaic(evidences, mosaic_path)
@@ -733,6 +1026,22 @@ class UiCollector:
                     {"bounds": bounds},
                 )
         self.db.connection.commit()
+        self._event(
+            "INFO",
+            "page.committed",
+            f"页面已入库，共 {len(evidences)} 个视口",
+            metric=metric,
+            local_date=local_date,
+            page=page_key,
+            activity=activity,
+            action="commit_page",
+            status="complete",
+            details={
+                "capture_id": capture_id,
+                "viewport_count": len(evidences),
+                "mosaic_sha256": mosaic_artifact.sha256,
+            },
+        )
         return capture_id
 
     def _capture_subpages(
@@ -744,11 +1053,43 @@ class UiCollector:
         max_scrolls: int = 12,
     ) -> None:
         visible_titles = self._visible_subpage_titles(main_capture_id, profile)
+        self._event(
+            "INFO",
+            "subpages.discovered",
+            f"发现 {len(visible_titles)} 个可采集子页面",
+            metric=metric,
+            local_date=local_date,
+            page=metric,
+            action="discover_subpages",
+            status="complete",
+            details={"titles": sorted(visible_titles)},
+        )
         for title in profile.subpage_titles:
             if title not in visible_titles:
                 continue
             if not self._open_text_target(title):
+                self._event(
+                    "WARNING",
+                    "subpage.open_failed",
+                    f"发现子页面入口但无法打开：{title}",
+                    metric=metric,
+                    local_date=local_date,
+                    page=f"{metric}/{title}",
+                    action="open_subpage",
+                    status="failed",
+                )
                 continue
+            self._event(
+                "INFO",
+                "subpage.opened",
+                f"已打开子页面：{title}",
+                metric=metric,
+                local_date=local_date,
+                page=f"{metric}/{title}",
+                activity=self.adb.foreground(),
+                action="open_subpage",
+                status="complete",
+            )
             time.sleep(0.9)
             try:
                 self.capture_page(
@@ -760,6 +1101,16 @@ class UiCollector:
             finally:
                 self.adb.keyevent("BACK")
                 time.sleep(0.8)
+                self._event(
+                    "INFO",
+                    "subpage.returned",
+                    f"已从子页面返回主详情：{title}",
+                    metric=metric,
+                    local_date=local_date,
+                    page=metric,
+                    action="back",
+                    status="complete",
+                )
 
     def _visible_subpage_titles(
         self,
@@ -870,6 +1221,16 @@ class UiCollector:
         with tempfile.TemporaryDirectory(prefix="ohealth-resume-nav-") as temp:
             temp_root = Path(temp)
             rounds = 0
+            self._event(
+                "INFO",
+                "resume.batch_start",
+                f"开始逐日批量翻页：{current.isoformat()} → {checkpoint.isoformat()}",
+                metric=profile.metric,
+                local_date=current.isoformat(),
+                page=profile.metric,
+                action="previous_day_batches",
+                status="started",
+            )
             while current > checkpoint:
                 rounds += 1
                 if rounds > 1000:
@@ -883,6 +1244,17 @@ class UiCollector:
                 if point is None:
                     return current
                 requested = min(batch_size, (current - checkpoint).days)
+                self._event(
+                    "INFO",
+                    "resume.batch_tap",
+                    f"连续点击上一天 {requested} 次",
+                    metric=profile.metric,
+                    local_date=current.isoformat(),
+                    page=profile.metric,
+                    action="tap_previous_day",
+                    status="started",
+                    details={"round": rounds, "requested": requested},
+                )
                 for _ in range(requested):
                     self.adb.tap(*point)
                     if tap_delay:
@@ -892,12 +1264,34 @@ class UiCollector:
                 label = updated.date_label(profile)
                 parsed = date_from_label(label or "", current - dt.timedelta(days=requested))
                 if parsed is None or parsed >= current:
+                    self._event(
+                        "WARNING",
+                        "resume.batch_stalled",
+                        "批量翻页后未读取到更早日期",
+                        metric=profile.metric,
+                        local_date=current.isoformat(),
+                        page=profile.metric,
+                        action="verify_date",
+                        status="stalled",
+                        details={"ui_label": label},
+                    )
                     return current
                 if parsed < checkpoint:
                     raise ExporterError(
                         f"续跑日期越过检查点：{parsed} < {checkpoint}"
                     )
                 current = parsed
+                self._event(
+                    "INFO",
+                    "resume.batch_verified",
+                    f"批量翻页后确认日期 {current.isoformat()}",
+                    metric=profile.metric,
+                    local_date=current.isoformat(),
+                    page=profile.metric,
+                    action="verify_date",
+                    status="complete",
+                    details={"ui_label": label, "round": rounds},
+                )
         return current
 
     def _resume_via_calendar(
@@ -931,6 +1325,16 @@ class UiCollector:
             )
 
         calendar_open = False
+        self._event(
+            "INFO",
+            "calendar.start",
+            f"准备通过日历直达 checkpoint {checkpoint.isoformat()}",
+            metric=profile.metric,
+            local_date=checkpoint.isoformat(),
+            page=profile.metric,
+            action="open_calendar",
+            status="started",
+        )
         with tempfile.TemporaryDirectory(prefix="ohealth-calendar-resume-") as temp:
             temp_root = Path(temp)
             try:
@@ -941,16 +1345,42 @@ class UiCollector:
                     page_tree, _ = self.dump_tree(temp_root, "page")
                 opener = page_tree.by_id("iv_down") or page_tree.date_node(profile)
                 if opener is None:
-                    print(
-                        f"[calendar] {profile.metric}: no date-picker opener; "
-                        "falling back to previous-day batches",
-                        flush=True,
+                    self._event(
+                        "WARNING",
+                        "calendar.opener_missing",
+                        "未找到日期下拉入口",
+                        metric=profile.metric,
+                        local_date=checkpoint.isoformat(),
+                        page=profile.metric,
+                        action="find_calendar_opener",
+                        status="failed",
                     )
                     return None
                 clickable = page_tree.clickable_ancestor(opener) or opener
                 opener_bounds = parse_bounds(clickable.attrib.get("bounds", ""))
                 if opener_bounds is None:
+                    self._event(
+                        "WARNING",
+                        "calendar.opener_bounds_missing",
+                        "日期下拉入口没有可点击坐标",
+                        metric=profile.metric,
+                        local_date=checkpoint.isoformat(),
+                        page=profile.metric,
+                        action="find_calendar_opener",
+                        status="failed",
+                    )
                     return None
+                self._event(
+                    "INFO",
+                    "calendar.tap_opener",
+                    "点击日期右侧下拉箭头",
+                    metric=profile.metric,
+                    local_date=checkpoint.isoformat(),
+                    page=profile.metric,
+                    action="tap",
+                    status="started",
+                    details={"bounds": opener_bounds},
+                )
                 self.adb.tap(*center(opener_bounds))
                 deadline = time.time() + 8
                 calendar_tree: UiTree | None = None
@@ -960,8 +1390,34 @@ class UiCollector:
                     if candidate.by_id("recycler_view") is not None and calendar_month_views(candidate):
                         calendar_tree = candidate
                         calendar_open = True
+                        visible = calendar_month_views(candidate)
+                        self._event(
+                            "INFO",
+                            "calendar.opened",
+                            "日历已打开并识别到月份列表",
+                            metric=profile.metric,
+                            local_date=checkpoint.isoformat(),
+                            page="calendar",
+                            action="verify_calendar",
+                            status="complete",
+                            details={
+                                "visible_months": [
+                                    f"{item.year:04d}-{item.month:02d}" for item in visible
+                                ]
+                            },
+                        )
                         break
                 if calendar_tree is None:
+                    self._event(
+                        "WARNING",
+                        "calendar.open_timeout",
+                        "点击后 8 秒内未识别到日历",
+                        metric=profile.metric,
+                        local_date=checkpoint.isoformat(),
+                        page=profile.metric,
+                        action="verify_calendar",
+                        status="timeout",
+                    )
                     return None
 
                 target_index = month_index(checkpoint.year, checkpoint.month)
@@ -1001,6 +1457,17 @@ class UiCollector:
                         else:
                             align_start = align_end = 0
                         if align_start != align_end:
+                            self._event(
+                                "INFO",
+                                "calendar.align_month",
+                                f"目标月份 {checkpoint.year}-{checkpoint.month:02d} 尚未完整显示，进行对齐滚动",
+                                metric=profile.metric,
+                                local_date=checkpoint.isoformat(),
+                                page="calendar",
+                                action="swipe_calendar",
+                                status="started",
+                                details={"round": round_index, "grid_bounds": matching.grid_bounds},
+                            )
                             self.adb.swipe(
                                 gesture_x,
                                 align_start,
@@ -1016,6 +1483,17 @@ class UiCollector:
                         point = calendar_day_point(matching, checkpoint.day, width)
                         if point is None:
                             return None
+                        self._event(
+                            "INFO",
+                            "calendar.tap_day",
+                            f"目标月份已完整对齐，点击 {checkpoint.isoformat()}",
+                            metric=profile.metric,
+                            local_date=checkpoint.isoformat(),
+                            page="calendar",
+                            action="tap_calendar_day",
+                            status="started",
+                            details={"point": point, "grid_bounds": matching.grid_bounds},
+                        )
                         self.adb.tap(*point)
                         deadline = time.time() + 10
                         while time.time() < deadline:
@@ -1024,12 +1502,28 @@ class UiCollector:
                             label = result_tree.date_label(profile)
                             parsed = date_from_label(label or "", checkpoint)
                             if parsed == checkpoint:
-                                print(
-                                    f"[calendar] {profile.metric}: jumped directly to "
-                                    f"{checkpoint.isoformat()}",
-                                    flush=True,
+                                self._event(
+                                    "INFO",
+                                    "calendar.confirmed",
+                                    f"详情页回读日期确认：{checkpoint.isoformat()}",
+                                    metric=profile.metric,
+                                    local_date=checkpoint.isoformat(),
+                                    page=profile.metric,
+                                    action="verify_date",
+                                    status="complete",
+                                    details={"ui_label": label, "tap_point": point},
                                 )
                                 return parsed
+                        self._event(
+                            "WARNING",
+                            "calendar.date_timeout",
+                            "点击目标日期后未在 10 秒内回读到准确日期",
+                            metric=profile.metric,
+                            local_date=checkpoint.isoformat(),
+                            page=profile.metric,
+                            action="verify_date",
+                            status="timeout",
+                        )
                         return None
 
                     first_index = month_index(months[0].year, months[0].month)
@@ -1051,15 +1545,37 @@ class UiCollector:
                             500,
                         )
                         time.sleep(0.12)
+                    self._event(
+                        "INFO",
+                        "calendar.scroll_months",
+                        f"向目标月份滚动 {min(max(1, distance), 8)} 次",
+                        metric=profile.metric,
+                        local_date=checkpoint.isoformat(),
+                        page="calendar",
+                        action="swipe_calendar",
+                        status="complete",
+                        details={
+                            "round": round_index,
+                            "distance_months": distance,
+                            "visible_first": f"{months[0].year:04d}-{months[0].month:02d}",
+                            "visible_last": f"{months[-1].year:04d}-{months[-1].month:02d}",
+                        },
+                    )
                     time.sleep(0.6)
                     calendar_tree, _ = self.dump_tree(
                         temp_root, f"calendar-nav-{round_index:02d}"
                     )
             except Exception as exc:
-                print(
-                    f"[calendar] {profile.metric}: {exc}; "
-                    "falling back to previous-day batches",
-                    flush=True,
+                self._event(
+                    "WARNING",
+                    "calendar.exception",
+                    f"日历直达异常：{exc}",
+                    metric=profile.metric,
+                    local_date=checkpoint.isoformat(),
+                    page="calendar" if calendar_open else profile.metric,
+                    action="calendar_resume",
+                    status="failed",
+                    details={"exception_type": type(exc).__name__},
                 )
             finally:
                 if calendar_open:
@@ -1069,6 +1585,16 @@ class UiCollector:
                             if final_tree.by_id("recycler_view") is not None:
                                 self.adb.keyevent("BACK")
                                 time.sleep(0.4)
+                                self._event(
+                                    "INFO",
+                                    "calendar.closed",
+                                    "日历直达未完成，已安全关闭日历",
+                                    metric=profile.metric,
+                                    local_date=checkpoint.isoformat(),
+                                    page=profile.metric,
+                                    action="back",
+                                    status="complete",
+                                )
                         except Exception:
                             pass
         return None

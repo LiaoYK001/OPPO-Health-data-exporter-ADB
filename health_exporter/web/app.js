@@ -3,6 +3,10 @@ const metricOrder = ["activity", "heart_rate", "sleep", "spo2", "blood_pressure"
 const phaseLabels = { paused: "已安全暂停", collecting: "正在采集", stale: "状态待修复", idle: "空闲" };
 let selectedLog = "";
 let statusTimer;
+let operationTimer;
+let statusBusy = false;
+let operationBusy = false;
+let cachedEvents = [];
 
 function fmtBytes(value = 0) {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -21,6 +25,80 @@ function escapeHtml(value = "") {
 function statusBadge(status) {
   const kind = status === "complete" ? "ok" : status === "running" ? "warn" : ["failed", "stale"].includes(status) ? "danger" : "";
   return `<span class="badge ${kind}">${escapeHtml(status || "unknown")}</span>`;
+}
+
+function fmtEventTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const datePart = date.toLocaleDateString("zh-CN");
+  const timePart = date.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3 });
+  return `${datePart} ${timePart}`;
+}
+
+function eventVisible(event, selected) {
+  const level = String(event.level || "INFO").toUpperCase();
+  if (selected === "ALL") return true;
+  if (selected === "DEBUG") return level === "DEBUG";
+  const ranks = { DEBUG: 0, INFO: 1, WARNING: 2, ERROR: 3 };
+  return (ranks[level] ?? 1) >= (ranks[selected] ?? 0);
+}
+
+function renderOperations(events) {
+  cachedEvents = events;
+  const latest = events.at(-1);
+  if (latest) {
+    const location = [latest.metric, latest.local_date, latest.page].filter(Boolean).join(" · ") || "全局";
+    $("#current-operation").innerHTML = `<div>
+      <span class="muted">当前/最近操作 · ${escapeHtml(fmtEventTime(latest.timestamp))}</span>
+      <strong>${escapeHtml(location)}</strong>
+      <p>${escapeHtml(latest.activity || "APP 页面未记录")}</p>
+    </div><div>
+      <span class="muted">${escapeHtml(latest.level || "INFO")} · ${escapeHtml(latest.action || latest.event || "operation")}</span>
+      <strong>${escapeHtml(latest.message || "—")}</strong>
+      <p>状态 ${escapeHtml(latest.status || "—")} · run ${escapeHtml(latest.run_id || "—")}</p>
+    </div>`;
+  } else {
+    $("#current-operation").innerHTML = '<div><span class="muted">当前操作</span><strong>等待采集事件</strong><p>采集器恢复后会自动显示当前指标、日期、页面和动作。</p></div>';
+  }
+
+  const selectedLevel = $("#event-level").value;
+  const visible = events.filter((event) => eventVisible(event, selectedLevel));
+  const stream = $("#operation-stream");
+  stream.innerHTML = visible.map((event) => {
+    const level = String(event.level || "INFO").toUpperCase();
+    const location = [event.metric, event.local_date].filter(Boolean).join(" · ") || "全局";
+    const page = event.page || event.activity || "—";
+    const details = event.details && Object.keys(event.details).length
+      ? `<details class="event-details"><summary>查看上下文</summary><code>${escapeHtml(JSON.stringify(event.details, null, 2))}</code></details>`
+      : "";
+    return `<article class="event-row level-${level.toLowerCase()}">
+      <time class="event-time" datetime="${escapeHtml(event.timestamp || "")}">${escapeHtml(fmtEventTime(event.timestamp))}</time>
+      <span class="level-pill ${level.toLowerCase()}">${escapeHtml(level)}</span>
+      <div class="event-context"><strong>${escapeHtml(location)}</strong><small>${escapeHtml(page)}</small></div>
+      <div class="event-message"><strong>${escapeHtml(event.message || event.event || "—")}</strong><small>${escapeHtml(event.action || event.event || "operation")} · ${escapeHtml(event.status || "—")}</small>${details}</div>
+    </article>`;
+  }).join("") || '<p class="muted empty-state">当前筛选条件下没有操作事件。</p>';
+  if ($("#event-autoscroll").checked) stream.scrollTop = stream.scrollHeight;
+}
+
+async function refreshOperations() {
+  if (operationBusy) return;
+  operationBusy = true;
+  const limit = Number($("#event-limit").value || 300);
+  try {
+    const response = await fetch(`/api/events?limit=${limit}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || response.statusText);
+    renderOperations(data.events || []);
+    $("#operation-connection").className = "badge ok";
+    $("#operation-connection").textContent = `实时 · ${fmtBytes(data.bytes || 0)}`;
+  } catch (error) {
+    $("#operation-connection").className = "badge danger";
+    $("#operation-connection").textContent = `读取失败 · ${error}`;
+  } finally {
+    operationBusy = false;
+  }
 }
 
 function renderSystem(data) {
@@ -107,6 +185,8 @@ async function refreshLog() {
 }
 
 async function refresh() {
+  if (statusBusy) return;
+  statusBusy = true;
   try {
     const response = await fetch("/api/status", { cache: "no-store" });
     const data = await response.json();
@@ -126,12 +206,32 @@ async function refresh() {
     await refreshLog();
   } catch (error) {
     $("#updated-at").textContent = `刷新失败：${error}`;
+  } finally {
+    statusBusy = false;
   }
 }
 
-$("#refresh").addEventListener("click", refresh);
+function scheduleRefresh() {
+  clearInterval(statusTimer);
+  clearInterval(operationTimer);
+  const interval = Number($("#refresh-interval").value || 0);
+  if (interval > 0) {
+    statusTimer = setInterval(refresh, interval);
+    operationTimer = setInterval(refreshOperations, interval);
+    $("#operation-connection").title = `每 ${interval / 1000} 秒刷新`;
+  } else {
+    $("#operation-connection").className = "badge warn";
+    $("#operation-connection").textContent = "自动刷新已暂停";
+  }
+}
+
+$("#refresh").addEventListener("click", () => { refresh(); refreshOperations(); });
 $("#log-select").addEventListener("change", (event) => { selectedLog = event.target.value; refreshLog(); });
 $("#log-lines").addEventListener("change", refreshLog);
+$("#event-level").addEventListener("change", () => renderOperations(cachedEvents));
+$("#event-limit").addEventListener("change", refreshOperations);
+$("#refresh-interval").addEventListener("change", () => { scheduleRefresh(); refresh(); refreshOperations(); });
 refresh();
-statusTimer = setInterval(refresh, 5000);
-window.addEventListener("beforeunload", () => clearInterval(statusTimer));
+refreshOperations();
+scheduleRefresh();
+window.addEventListener("beforeunload", () => { clearInterval(statusTimer); clearInterval(operationTimer); });

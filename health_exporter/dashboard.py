@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .adb import AdbClient, find_adb
 from .constants import DEFAULT_SERIAL, PACKAGE
+from .operation_log import EVENT_LOG_NAME, read_event_tail
 
 
 METRIC_NAMES = {
@@ -72,6 +73,7 @@ class DashboardState:
         self.serial = serial
         self.database_path = self.data_dir / "health.sqlite3"
         self.log_dir = self.data_dir / "logs"
+        self.operation_log_path = self.log_dir / EVENT_LOG_NAME
         self.proof_dir = self.workspace / ".diagnostics" / "calendar-proof"
         self._probe_cache = ProbeCache()
         self._probe_lock = threading.Lock()
@@ -285,6 +287,9 @@ class DashboardState:
             "modified_at": path.stat().st_mtime,
         }
 
+    def read_events(self, limit: int = 300) -> dict[str, Any]:
+        return read_event_tail(self.operation_log_path, limit)
+
     def calendar_proof(self) -> dict[str, Any]:
         files = {
             "before": ("before.xml", "before.png"),
@@ -412,6 +417,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 name = query.get("name", [""])[0]
                 lines = int(query.get("lines", ["500"])[0])
                 self.send_json(self.state.read_log(name, lines))
+                return
+            if parsed.path == "/api/events":
+                query = parse_qs(parsed.query)
+                limit = int(query.get("limit", ["300"])[0])
+                self.send_json(self.state.read_events(limit))
                 return
             if parsed.path == "/api/calendar-image":
                 query = parse_qs(parsed.query)

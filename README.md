@@ -103,7 +103,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
 ```
 
-浏览器会打开 `http://127.0.0.1:8765/`。页面每 5 秒更新一次，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、批次记录、未解决失败、素材数量和容量、日历跳转证据，以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
+浏览器会打开 `http://127.0.0.1:8765/`。页面可选择 1 秒、2 秒或 5 秒刷新，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、批次记录、未解决失败、素材数量和容量、日历跳转证据，以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
+
+“实时详细操作”单独读取 `data/logs/operation-events.jsonl`。采集器会为进入指标、读取日期、打开/滚动日历、点击日期、逐屏滚动、保存 PNG/XML、进入和退出子页面、提交页面/checkpoint、回退及失败分别写入结构化事件。每条事件包含本地毫秒时间戳、`DEBUG/INFO/WARNING/ERROR` 级别、run ID、指标、日期、当前页面/Activity、动作、结果和附加上下文。页面支持级别筛选、100/300/1000 条尾部范围和自动滚到底部；选择 1 秒即为最快实时刷新。
 
 也可直接运行：
 

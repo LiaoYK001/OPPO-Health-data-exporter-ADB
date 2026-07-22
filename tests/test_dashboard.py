@@ -6,6 +6,7 @@ import pytest
 
 from health_exporter.dashboard import DashboardState
 from health_exporter.db import Database
+from health_exporter.operation_log import EVENT_LOG_NAME, OperationLogger
 
 
 def test_dashboard_snapshot_reads_checkpoint_and_failures(tmp_path: Path) -> None:
@@ -75,3 +76,28 @@ def test_dashboard_log_reader_decodes_windows_chinese_log(tmp_path: Path) -> Non
 
     assert result["text"] == message.replace("\r\n", "\n")
     assert result["encoding"] == "gb18030"
+
+
+def test_dashboard_reads_realtime_operation_events(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    logger = OperationLogger(
+        data_dir / "logs" / EVENT_LOG_NAME,
+        "run-dashboard",
+        echo=False,
+    )
+    logger.log(
+        "INFO",
+        "viewport.captured",
+        "已保存第 2 个视口",
+        metric="heart_rate",
+        local_date="2024-04-08",
+        page="heart_rate",
+        action="capture_viewport",
+        status="complete",
+    )
+    state = DashboardState(tmp_path, data_dir)
+
+    result = state.read_events(100)
+
+    assert result["events"][0]["event"] == "viewport.captured"
+    assert result["events"][0]["level"] == "INFO"

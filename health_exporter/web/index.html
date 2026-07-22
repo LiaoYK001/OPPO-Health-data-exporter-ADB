@@ -63,6 +63,46 @@
         <div id="calendar-proof" class="proof-grid"></div>
       </section>
 
+      <section class="panel wide operation-panel">
+        <div class="panel-heading operation-heading">
+          <div><p class="eyebrow">REAL-TIME OPERATION STREAM</p><h2>实时详细操作</h2></div>
+          <div class="operation-actions">
+            <span id="operation-connection" class="badge">等待连接</span>
+            <label>级别
+              <select id="event-level" aria-label="操作日志级别">
+                <option value="ALL">全部</option>
+                <option value="INFO">INFO 及以上</option>
+                <option value="WARNING">WARNING 及以上</option>
+                <option value="ERROR">仅 ERROR</option>
+                <option value="DEBUG">仅 DEBUG</option>
+              </select>
+            </label>
+            <label>显示
+              <select id="event-limit" aria-label="操作日志数量">
+                <option value="100">100 条</option>
+                <option value="300" selected>300 条</option>
+                <option value="1000">1000 条</option>
+              </select>
+            </label>
+            <label>刷新
+              <select id="refresh-interval" aria-label="刷新间隔">
+                <option value="1000">1 秒</option>
+                <option value="2000">2 秒</option>
+                <option value="5000" selected>5 秒</option>
+                <option value="0">暂停</option>
+              </select>
+            </label>
+            <label class="check-label"><input id="event-autoscroll" type="checkbox" checked /> 自动滚到底部</label>
+          </div>
+        </div>
+        <article id="current-operation" class="current-operation" aria-live="polite">
+          <div><span class="muted">当前操作</span><strong>等待采集事件</strong></div>
+        </article>
+        <div id="operation-stream" class="operation-stream" tabindex="0" aria-label="实时操作日志">
+          <p class="muted empty-state">采集器当前未运行。恢复后，详细操作会在这里实时出现。</p>
+        </div>
+      </section>
+
       <section class="panel wide log-panel">
         <div class="panel-heading">
           <div><p class="eyebrow">LIVE LOG TAIL</p><h2>详细日志</h2></div>
