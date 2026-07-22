@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .constants import PRIMARY_METRICS, UI_PROFILES, MetricUiProfile
 from .db import Database
-from .ui import DATE_PATTERN, date_from_label
+from .ui import DATE_PATTERN, date_from_label, parse_bounds
 
 
 def _hash_file(path: Path) -> str:
@@ -109,8 +109,43 @@ def _heart_ui_summary(payload: dict[str, Any]) -> dict[str, Any]:
                     if match:
                         result[field] = int(match.group(1))
                         break
+                    if re.fullmatch(r"--\s*次/分", candidate):
+                        result[f"{field}__placeholder"] = "--"
+                        break
                 break
     return result
+
+
+def _heart_main_scroll_state(payload: dict[str, Any]) -> dict[str, Any]:
+    viewports = payload.get("viewports")
+    if not isinstance(viewports, list):
+        viewports = []
+    max_chart_height = 0
+    has_sleep_baseline_card = False
+    for viewport in viewports:
+        if not isinstance(viewport, dict) or not isinstance(viewport.get("nodes"), list):
+            continue
+        for node in viewport["nodes"]:
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("resource_id") or "") == "view_heart_rate_day":
+                bounds = parse_bounds(str(node.get("bounds") or ""))
+                if bounds:
+                    max_chart_height = max(max_chart_height, bounds[3] - bounds[1])
+            label = str(node.get("text") or node.get("content_desc") or "").strip()
+            if label == "睡眠基准心率":
+                has_sleep_baseline_card = True
+    state = {
+        "viewport_count": len(viewports),
+        "max_chart_height": max_chart_height,
+        "has_sleep_baseline_card": has_sleep_baseline_card,
+    }
+    state["complete"] = (
+        state["viewport_count"] >= 2
+        and max_chart_height >= 1000
+        and has_sleep_baseline_card
+    )
+    return state
 
 
 def _weight_ui_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -335,6 +370,379 @@ class Verifier:
         self.db = db
         self.data_dir = data_dir
 
+    def _validate_raw_snapshot_manifests(
+        self,
+        source_id: int,
+        *,
+        verify_hashes: bool,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        runs = self.db.connection.execute(
+            """
+            SELECT id, command FROM ingest_runs
+            WHERE source_id=? AND status='complete'
+              AND command IN ('snapshot-source','key-capture')
+            ORDER BY started_at
+            """,
+            (source_id,),
+        ).fetchall()
+        issues: list[dict[str, Any]] = []
+        files_checked = 0
+        manifests_checked = 0
+        manifest_artifacts_checked = 0
+        for run in runs:
+            run_id = str(run["id"])
+            command = str(run["command"])
+            manifest_path = self.data_dir / "manifests" / (
+                f"oppo-snapshot-{run_id}.json"
+                if command == "snapshot-source"
+                else f"oppo-decrypted-{run_id}.json"
+            )
+            if not manifest_path.is_file():
+                issues.append(
+                    {
+                        "run_id": run_id,
+                        "command": command,
+                        "reason": "manifest_missing",
+                        "path": str(manifest_path),
+                    }
+                )
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                issues.append(
+                    {
+                        "run_id": run_id,
+                        "command": command,
+                        "reason": "manifest_unreadable",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            manifests_checked += 1
+            if str(manifest.get("run_id")) != run_id:
+                issues.append(
+                    {
+                        "run_id": run_id,
+                        "command": command,
+                        "reason": "manifest_run_id_mismatch",
+                        "actual": manifest.get("run_id"),
+                    }
+                )
+
+            manifest_digest = _hash_file(manifest_path)
+            if self.db.connection.execute(
+                "SELECT 1 FROM artifacts WHERE sha256=?", (manifest_digest,)
+            ).fetchone() is None:
+                issues.append(
+                    {
+                        "run_id": run_id,
+                        "command": command,
+                        "reason": "manifest_artifact_unregistered",
+                        "sha256": manifest_digest,
+                    }
+                )
+            else:
+                manifest_artifacts_checked += 1
+
+            if command == "snapshot-source":
+                manifest_files = manifest.get("files")
+                if not isinstance(manifest_files, list):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "manifest_files_invalid",
+                        }
+                    )
+                    continue
+            else:
+                manifest_files = [
+                    {
+                        "remote_path": manifest.get("source"),
+                        "local_path": manifest.get("local_path"),
+                        "sha256": manifest.get("sha256"),
+                        "sqlite_status": "sqlite",
+                        "schema_hash": manifest.get("schema_hash"),
+                        "row_count": manifest.get("target_row_count"),
+                    }
+                ]
+
+            snapshot_rows = self.db.connection.execute(
+                """
+                SELECT rs.source_path, rs.artifact_sha256, rs.sqlite_status,
+                       rs.schema_hash, rs.row_count, a.byte_size
+                FROM raw_snapshots rs
+                JOIN artifacts a ON a.sha256=rs.artifact_sha256
+                WHERE rs.run_id=? ORDER BY rs.source_path
+                """,
+                (run_id,),
+            ).fetchall()
+            rows_by_source = {str(row["source_path"]): row for row in snapshot_rows}
+            manifest_sources: set[str] = set()
+            for item in manifest_files:
+                if not isinstance(item, dict):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "manifest_file_invalid",
+                        }
+                    )
+                    continue
+                source_path = str(item.get("remote_path") or "")
+                manifest_sources.add(source_path)
+                row = rows_by_source.get(source_path)
+                if row is None:
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_row_missing",
+                            "source_path": source_path,
+                        }
+                    )
+                    continue
+                expected_sha = str(item.get("sha256") or "")
+                if expected_sha != str(row["artifact_sha256"]):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_sha_mismatch",
+                            "source_path": source_path,
+                            "manifest_sha256": expected_sha,
+                            "database_sha256": str(row["artifact_sha256"]),
+                        }
+                    )
+                expected_status = item.get("sqlite_status")
+                if expected_status and str(expected_status) != str(row["sqlite_status"]):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_status_mismatch",
+                            "source_path": source_path,
+                        }
+                    )
+                if item.get("schema_hash") and str(item["schema_hash"]) != str(
+                    row["schema_hash"]
+                ):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_schema_hash_mismatch",
+                            "source_path": source_path,
+                        }
+                    )
+                if item.get("row_count") is not None and int(item["row_count"]) != int(
+                    row["row_count"]
+                ):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_row_count_mismatch",
+                            "source_path": source_path,
+                        }
+                    )
+                local_value = item.get("local_path")
+                local_path = self.data_dir / str(local_value or "")
+                try:
+                    local_path.resolve().relative_to(self.data_dir.resolve())
+                except ValueError:
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_local_path_outside_data_dir",
+                            "path": str(local_path),
+                        }
+                    )
+                    continue
+                if not local_path.is_file():
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_local_file_missing",
+                            "path": str(local_path),
+                        }
+                    )
+                    continue
+                if local_path.stat().st_size != int(row["byte_size"]):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_local_file_size",
+                            "path": str(local_path),
+                        }
+                    )
+                    continue
+                if verify_hashes and _hash_file(local_path) != str(row["artifact_sha256"]):
+                    issues.append(
+                        {
+                            "run_id": run_id,
+                            "command": command,
+                            "reason": "snapshot_local_file_hash",
+                            "path": str(local_path),
+                        }
+                    )
+                files_checked += 1
+            for extra_source in sorted(set(rows_by_source) - manifest_sources):
+                issues.append(
+                    {
+                        "run_id": run_id,
+                        "command": command,
+                        "reason": "snapshot_row_not_in_manifest",
+                        "source_path": extra_source,
+                    }
+                )
+        return (
+            {
+                "completed_runs": len(runs),
+                "manifests_checked": manifests_checked,
+                "manifest_artifacts_checked": manifest_artifacts_checked,
+                "files_checked": files_checked,
+                "issues": len(issues),
+            },
+            issues,
+        )
+
+    def _validate_latest_inventory(
+        self,
+        source_id: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        failures: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        run = self.db.connection.execute(
+            """
+            SELECT id, status FROM ingest_runs
+            WHERE source_id=? AND command='inventory'
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+        if run is None:
+            result = {
+                "status": "missing",
+                "run_id": None,
+                "cards": 0,
+                "included": 0,
+                "excluded": 0,
+                "unknown": 0,
+                "view_xml_artifacts_checked": 0,
+                "manifest_artifact_checked": False,
+            }
+            warnings.append({"type": "inventory_missing", "source_id": source_id})
+            return result, failures, warnings
+
+        run_id = str(run["id"])
+        run_status = str(run["status"])
+        manifest_path = self.data_dir / "manifests" / f"inventory-{run_id}.json"
+        result = {
+            "status": run_status,
+            "run_id": run_id,
+            "cards": 0,
+            "included": 0,
+            "excluded": 0,
+            "unknown": 0,
+            "view_xml_artifacts_checked": 0,
+            "manifest_artifact_checked": False,
+        }
+        if not manifest_path.is_file():
+            failures.append(
+                {
+                    "type": "inventory_manifest_missing",
+                    "run_id": run_id,
+                    "path": str(manifest_path),
+                }
+            )
+            return result, failures, warnings
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            failures.append(
+                {
+                    "type": "inventory_manifest_unreadable",
+                    "run_id": run_id,
+                    "error": str(exc),
+                }
+            )
+            return result, failures, warnings
+        if str(manifest.get("run_id")) != run_id:
+            failures.append(
+                {
+                    "type": "inventory_run_id_mismatch",
+                    "run_id": run_id,
+                    "actual": manifest.get("run_id"),
+                }
+            )
+        manifest_digest = _hash_file(manifest_path)
+        result["manifest_artifact_checked"] = (
+            self.db.connection.execute(
+                "SELECT 1 FROM artifacts WHERE sha256=?", (manifest_digest,)
+            ).fetchone()
+            is not None
+        )
+        if not result["manifest_artifact_checked"]:
+            failures.append(
+                {
+                    "type": "inventory_manifest_artifact_unregistered",
+                    "run_id": run_id,
+                    "sha256": manifest_digest,
+                }
+            )
+
+        ui = manifest.get("ui")
+        if not isinstance(ui, dict):
+            failures.append({"type": "inventory_payload_invalid", "run_id": run_id})
+            return result, failures, warnings
+        for field in ("cards", "included", "excluded", "unknown"):
+            values = ui.get(field)
+            if not isinstance(values, list):
+                failures.append(
+                    {
+                        "type": "inventory_field_invalid",
+                        "run_id": run_id,
+                        "field": field,
+                    }
+                )
+                values = []
+            result[field] = len(values)
+        unknown = ui.get("unknown") if isinstance(ui.get("unknown"), list) else []
+        if run_status != "complete" or unknown:
+            failures.append(
+                {
+                    "type": "inventory_unknown_cards",
+                    "run_id": run_id,
+                    "run_status": run_status,
+                    "unknown": unknown,
+                }
+            )
+        for view in ui.get("views", []):
+            if not isinstance(view, dict):
+                failures.append(
+                    {"type": "inventory_view_invalid", "run_id": run_id}
+                )
+                continue
+            sha256 = view.get("xml_sha256")
+            if not isinstance(sha256, str) or self.db.connection.execute(
+                "SELECT 1 FROM artifacts WHERE sha256=?", (sha256,)
+            ).fetchone() is None:
+                failures.append(
+                    {
+                        "type": "inventory_view_artifact_missing",
+                        "run_id": run_id,
+                        "sha256": sha256,
+                    }
+                )
+                continue
+            result["view_xml_artifacts_checked"] += 1
+        return result, failures, warnings
+
     def verify(
         self,
         *,
@@ -348,8 +756,35 @@ class Verifier:
             "SELECT sha256, relative_path, byte_size FROM artifacts"
         ).fetchall()
         checked_artifacts = 0
+        content_root = (self.data_dir / "artifacts" / "sha256").resolve()
+        registered_paths: set[str] = set()
+        invalid_locations: list[dict[str, Any]] = []
         for row in artifact_rows:
+            relative_path = Path(str(row["relative_path"]))
+            registered_paths.add(relative_path.as_posix())
             path = self.data_dir / row["relative_path"]
+            try:
+                resolved_relative = path.resolve().relative_to(content_root)
+            except ValueError:
+                invalid_locations.append(
+                    {
+                        "sha256": str(row["sha256"]),
+                        "path": str(path),
+                        "reason": "outside_content_store",
+                    }
+                )
+            else:
+                if (
+                    resolved_relative.parent.name != str(row["sha256"])[:2]
+                    or resolved_relative.stem != str(row["sha256"])
+                ):
+                    invalid_locations.append(
+                        {
+                            "sha256": str(row["sha256"]),
+                            "path": str(path),
+                            "reason": "not_sha256_addressed",
+                        }
+                    )
             if not path.is_file():
                 failures.append(
                     {"type": "artifact_missing", "sha256": row["sha256"], "path": str(path)}
@@ -366,6 +801,190 @@ class Verifier:
                 )
             checked_artifacts += 1
 
+        content_files = (
+            [path for path in content_root.rglob("*") if path.is_file()]
+            if content_root.is_dir()
+            else []
+        )
+        # A collector may have committed a newly copied artifact after the
+        # first query. Refresh registrations before classifying filesystem
+        # files so a concurrent verification does not invent an orphan.
+        registered_paths.update(
+            Path(str(row[0])).as_posix()
+            for row in self.db.connection.execute("SELECT relative_path FROM artifacts")
+        )
+        orphan_files = sorted(
+            str(path)
+            for path in content_files
+            if path.relative_to(self.data_dir).as_posix() not in registered_paths
+        )
+        artifact_store_validation = {
+            "registered_files": len(artifact_rows),
+            "content_files": len(content_files),
+            "orphan_files": len(orphan_files),
+            "invalid_locations": len(invalid_locations),
+        }
+        if invalid_locations:
+            failures.append(
+                {
+                    "type": "artifact_content_addressing",
+                    "count": len(invalid_locations),
+                    "items": invalid_locations,
+                }
+            )
+        if orphan_files:
+            issue = {
+                "type": "artifact_orphan_files",
+                "strict": bool(verify_all_artifacts),
+                "count": len(orphan_files),
+                "paths": orphan_files,
+            }
+            if verify_all_artifacts:
+                failures.append(issue)
+            else:
+                warnings.append(issue)
+
+        raw_snapshot_validation, raw_snapshot_issues = (
+            self._validate_raw_snapshot_manifests(
+                source,
+                verify_hashes=verify_all_artifacts,
+            )
+        )
+
+        inventory_validation, inventory_failures, inventory_warnings = (
+            self._validate_latest_inventory(source)
+        )
+        failures.extend(inventory_failures)
+        warnings.extend(inventory_warnings)
+        if raw_snapshot_issues:
+            failures.append(
+                {
+                    "type": "raw_snapshot_manifest",
+                    "count": len(raw_snapshot_issues),
+                    "items": raw_snapshot_issues,
+                }
+            )
+
+        page_evidence_validation = {
+            "pages": 0,
+            "viewports": 0,
+            "links_checked": 0,
+            "missing": 0,
+            "ambiguous": 0,
+            "invalid_payload": 0,
+        }
+        evidence_pages = self.db.connection.execute(
+            """
+            SELECT id, canonical_metric, local_date, page_key, display_payload_json
+            FROM page_captures WHERE source_id=? ORDER BY id
+            """,
+            (source,),
+        ).fetchall()
+        evidence_page_max_id = max(
+            (int(page["id"]) for page in evidence_pages),
+            default=0,
+        )
+        evidence_rows = self.db.connection.execute(
+            """
+            SELECT e.page_capture_id, e.artifact_sha256, e.role, e.viewport_index
+            FROM evidence_links e
+            JOIN page_captures p ON p.id=e.page_capture_id
+            WHERE p.source_id=? AND p.id<=?
+            ORDER BY e.page_capture_id, e.id
+            """,
+            (source, evidence_page_max_id),
+        ).fetchall()
+        links_by_page: dict[int, set[tuple[str, int | None, str]]] = {}
+        for evidence in evidence_rows:
+            links_by_page.setdefault(int(evidence["page_capture_id"]), set()).add(
+                (
+                    str(evidence["role"]),
+                    (
+                        int(evidence["viewport_index"])
+                        if evidence["viewport_index"] is not None
+                        else None
+                    ),
+                    str(evidence["artifact_sha256"]),
+                )
+            )
+        for page in evidence_pages:
+            page_id = int(page["id"])
+            page_evidence_validation["pages"] += 1
+            links = links_by_page.get(page_id, set())
+            mosaics = [item for item in links if item[0] == "page_mosaic"]
+            if not mosaics:
+                page_evidence_validation["missing"] += 1
+                failures.append(
+                    {
+                        "type": "page_evidence_missing",
+                        "page_capture_id": page_id,
+                        "metric": str(page["canonical_metric"]),
+                        "local_date": str(page["local_date"]),
+                        "page_key": str(page["page_key"]),
+                        "role": "page_mosaic",
+                    }
+                )
+            elif len(mosaics) > 1:
+                page_evidence_validation["ambiguous"] += 1
+                failures.append(
+                    {
+                        "type": "page_evidence_ambiguous",
+                        "page_capture_id": page_id,
+                        "role": "page_mosaic",
+                        "artifact_sha256s": sorted(item[2] for item in mosaics),
+                    }
+                )
+            else:
+                page_evidence_validation["links_checked"] += 1
+            try:
+                payload = json.loads(str(page["display_payload_json"]))
+                viewports = payload.get("viewports")
+                if not isinstance(viewports, list) or not viewports:
+                    raise ValueError("viewports must be a non-empty list")
+                for position, viewport in enumerate(viewports):
+                    if not isinstance(viewport, dict):
+                        raise ValueError(f"viewport {position} is not an object")
+                    viewport_index = int(viewport.get("index", position))
+                    page_evidence_validation["viewports"] += 1
+                    for payload_field, role in (
+                        ("screenshot_sha256", "viewport_png"),
+                        ("xml_sha256", "ui_xml"),
+                    ):
+                        sha256 = viewport.get(payload_field)
+                        if not isinstance(sha256, str) or not sha256:
+                            raise ValueError(
+                                f"viewport {viewport_index} missing {payload_field}"
+                            )
+                        expected_link = (role, viewport_index, sha256)
+                        if expected_link not in links:
+                            page_evidence_validation["missing"] += 1
+                            failures.append(
+                                {
+                                    "type": "page_evidence_missing",
+                                    "page_capture_id": page_id,
+                                    "metric": str(page["canonical_metric"]),
+                                    "local_date": str(page["local_date"]),
+                                    "page_key": str(page["page_key"]),
+                                    "role": role,
+                                    "viewport_index": viewport_index,
+                                    "artifact_sha256": sha256,
+                                }
+                            )
+                        else:
+                            page_evidence_validation["links_checked"] += 1
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                page_evidence_validation["invalid_payload"] += 1
+                failures.append(
+                    {
+                        "type": "page_evidence_payload",
+                        "page_capture_id": page_id,
+                        "metric": str(page["canonical_metric"]),
+                        "local_date": str(page["local_date"]),
+                        "page_key": str(page["page_key"]),
+                        "error": str(exc),
+                    }
+                )
+
         page_date_validation = {
             "main_pages": 0,
             "checked": 0,
@@ -374,10 +993,16 @@ class Verifier:
         }
         subpage_validation = {
             "visible_required": 0,
+            "source_required": 0,
             "matched": 0,
             "missing": 0,
             "pending_main_pages": 0,
             "incomplete_main_pages": 0,
+        }
+        main_scroll_validation = {
+            "heart_source_pages_required": 0,
+            "matched": 0,
+            "incomplete": 0,
         }
         metric_summary_validation = {
             "activity": {
@@ -478,6 +1103,20 @@ class Verifier:
             """,
             (source,),
         ).fetchall()
+        best_main_pages: dict[tuple[str, str], tuple[int, int]] = {}
+        for candidate in page_rows:
+            try:
+                candidate_payload = json.loads(candidate["display_payload_json"])
+                viewport_count = len(candidate_payload.get("viewports", []))
+            except (TypeError, json.JSONDecodeError):
+                viewport_count = 0
+            key = (
+                str(candidate["canonical_metric"]),
+                str(candidate["local_date"]),
+            )
+            rank = (viewport_count, int(candidate["id"]))
+            if rank > best_main_pages.get(key, (-1, -1)):
+                best_main_pages[key] = rank
         for row in page_rows:
             metric = str(row["canonical_metric"])
             profile = UI_PROFILES.get(metric)
@@ -523,8 +1162,44 @@ class Verifier:
                         "labels": [label for label, _ in candidates],
                     }
                 )
+            best_rank = best_main_pages.get((metric, expected.isoformat()))
+            if best_rank is not None and int(row["id"]) != best_rank[1]:
+                # Older immutable captures still receive artifact/date checks,
+                # while semantic completeness is evaluated against the best
+                # available viewport coverage for this metric/day.
+                continue
             visible_subpages = _visible_subpage_titles(payload, profile)
-            if visible_subpages and (metric, expected.isoformat()) not in completed_ui_days:
+            required_subpages = set(visible_subpages)
+            source_day_exists = self.db.connection.execute(
+                """
+                SELECT 1 FROM daily_metrics_current
+                WHERE source_id=? AND canonical_metric=? AND local_date=?
+                """,
+                (source, metric, expected.isoformat()),
+            ).fetchone() is not None
+            if source_day_exists and metric in {"activity", "heart_rate"}:
+                source_titles = set(profile.subpage_titles)
+                subpage_validation["source_required"] += len(
+                    source_titles - required_subpages
+                )
+                required_subpages.update(source_titles)
+            if source_day_exists and metric == "heart_rate":
+                main_scroll_validation["heart_source_pages_required"] += 1
+                scroll_state = _heart_main_scroll_state(payload)
+                if scroll_state["complete"]:
+                    main_scroll_validation["matched"] += 1
+                else:
+                    main_scroll_validation["incomplete"] += 1
+                    failures.append(
+                        {
+                            "type": "main_scroll_incomplete",
+                            "page_capture_id": int(row["id"]),
+                            "metric": metric,
+                            "local_date": expected.isoformat(),
+                            **scroll_state,
+                        }
+                    )
+            if required_subpages and (metric, expected.isoformat()) not in completed_ui_days:
                 if str(row["run_id"]) in running_run_ids:
                     subpage_validation["pending_main_pages"] += 1
                     continue
@@ -538,7 +1213,7 @@ class Verifier:
                         "local_date": expected.isoformat(),
                     }
                 )
-            for title in sorted(visible_subpages):
+            for title in sorted(required_subpages):
                 subpage_validation["visible_required"] += 1
                 page_key = f"{metric}/{title}"
                 if (metric, expected.isoformat(), page_key) in captured_page_keys:
@@ -577,11 +1252,17 @@ class Verifier:
                     "walking_average_bpm",
                     "sleep_baseline_bpm",
                 ):
-                    if field in ui_values:
-                        comparisons.append((field, summary.get(field), ui_values[field]))
+                    comparisons.append((field, summary.get(field), ui_values.get(field)))
                 for field, expected_value, ui_value in comparisons:
                     heart_validation["comparisons"] += 1
                     if ui_value is None:
+                        if (
+                            field != "range_bpm"
+                            and expected_value in (None, 0)
+                            and ui_values.get(f"{field}__placeholder") == "--"
+                        ):
+                            heart_validation["matched"] += 1
+                            continue
                         heart_validation["missing_ui_value"] += 1
                         failures.append(
                             {
@@ -1090,8 +1771,13 @@ class Verifier:
             "passed": not failures,
             "artifact_count": len(artifact_rows),
             "artifacts_checked": checked_artifacts,
+            "artifact_store_validation": artifact_store_validation,
+            "raw_snapshot_validation": raw_snapshot_validation,
+            "inventory_validation": inventory_validation,
+            "page_evidence_validation": page_evidence_validation,
             "page_date_validation": page_date_validation,
             "subpage_validation": subpage_validation,
+            "main_scroll_validation": main_scroll_validation,
             "metric_summary_validation": metric_summary_validation,
             "source_sequence_validation": source_sequence_validation,
             "coverage_counts": coverage_counts,

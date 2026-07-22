@@ -147,8 +147,26 @@ class UiTree:
         ]
         if not candidates:
             return None
+        # Detail screens frequently expose a full-screen horizontal ViewPager
+        # as well as a slightly smaller vertical ScrollView. Selecting only by
+        # area picks the pager and a vertical swipe leaves the page unchanged,
+        # silently truncating evidence to the first viewport. Prefer widgets
+        # whose Android class is explicitly vertical-scroll oriented.
+        scroll_views = [
+            node
+            for node in candidates
+            if "ScrollView" in node.attrib.get("class", "")
+        ]
+        vertical_collections = [
+            node
+            for node in candidates
+            if any(
+                name in node.attrib.get("class", "")
+                for name in ("RecyclerView", "ListView")
+            )
+        ]
         return max(
-            candidates,
+            scroll_views or vertical_collections or candidates,
             key=lambda node: (
                 (parse_bounds(node.attrib["bounds"])[2] - parse_bounds(node.attrib["bounds"])[0])
                 * (parse_bounds(node.attrib["bounds"])[3] - parse_bounds(node.attrib["bounds"])[1])
@@ -450,12 +468,22 @@ class UiCollector:
                             main_capture_id=main_capture_id,
                             max_scrolls=max_scrolls,
                         )
+                    has_source_day = self._has_source_day(metric, day)
                     self.db.set_coverage(
                         self.source_id,
                         metric,
                         day,
-                        "exact_ui",
-                        {"database": self._has_source_day(metric, day), "ui": True},
+                        "exact_ui" if has_source_day else "no_data",
+                        {
+                            "database": has_source_day,
+                            "ui": True,
+                            "no_data": not has_source_day,
+                            "basis": (
+                                "source_and_ui_evidence"
+                                if has_source_day
+                                else "exact_source_absence_with_ui_evidence"
+                            ),
+                        },
                         self.run_id,
                     )
                     next_checkpoint, moved = advance_checkpoint_date(
@@ -537,12 +565,15 @@ class UiCollector:
                     tree, xml_path = self.dump_tree(
                         temp_root, f"viewport-{index:02d}"
                     )
-                screenshot_path = self.screenshot(temp_root, f"viewport-{index:02d}")
                 payload = tree.visible_payload()
                 fingerprint = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
                 if fingerprint in seen:
                     break
                 seen.add(fingerprint)
+                # Only take the relatively expensive PNG after proving this
+                # viewport is new. At the bottom of a page the final swipe
+                # commonly leaves the hierarchy unchanged.
+                screenshot_path = self.screenshot(temp_root, f"viewport-{index:02d}")
                 xml_artifact = self.artifacts.put_file(xml_path, media_type="application/xml")
                 screenshot_artifact = self.artifacts.put_file(screenshot_path, media_type="image/png")
                 scrollable = tree.scrollable()
@@ -672,32 +703,46 @@ class UiCollector:
         return visible
 
     def _open_text_target(self, title: str, max_scrolls: int = 10) -> bool:
-        initial_view = self._scroll_to_top(max_swipes=8)
-        seen: set[str] = set()
         with tempfile.TemporaryDirectory(prefix="ohealth-find-subpage-") as temp:
+            temp_root = Path(temp)
+            # capture_page normally leaves the parent page close to the card
+            # that was just recorded. Try that visible state first; forcing a
+            # scroll-to-top before every subpage adds several hierarchy dumps.
+            current, _ = self.dump_tree(temp_root, "current")
+            if self._tap_text_target(current, title):
+                return True
+
+            initial_view = self._scroll_to_top(max_swipes=8)
+            seen: set[str] = set()
             for index in range(max_scrolls):
                 if index == 0 and initial_view is not None:
                     tree = initial_view[0]
                 else:
-                    tree, _ = self.dump_tree(Path(temp), f"find-{index:02d}")
+                    tree, _ = self.dump_tree(temp_root, f"find-{index:02d}")
                 fingerprint = hashlib.sha256(
                     canonical_json(tree.visible_payload()).encode()
                 ).hexdigest()
                 if fingerprint in seen:
                     return False
                 seen.add(fingerprint)
-                node = tree.by_text(title)
-                target = tree.clickable_ancestor(node) if node is not None else None
-                if target is not None:
-                    bounds = parse_bounds(target.attrib.get("bounds", ""))
-                    if bounds:
-                        self.adb.tap(*center(bounds))
-                        return True
+                if self._tap_text_target(tree, title):
+                    return True
                 scrollable = tree.scrollable()
                 if scrollable is None or not self._swipe_scrollable(scrollable, down=False):
                     return False
                 time.sleep(0.5)
         return False
+
+    def _tap_text_target(self, tree: UiTree, title: str) -> bool:
+        node = tree.by_text(title)
+        target = tree.clickable_ancestor(node) if node is not None else None
+        if target is None:
+            return False
+        bounds = parse_bounds(target.attrib.get("bounds", ""))
+        if not bounds:
+            return False
+        self.adb.tap(*center(bounds))
+        return True
 
     def _go_previous_day(
         self,
@@ -898,14 +943,36 @@ class UiCollector:
         x1, y1, x2, y2 = bounds
         x = (x1 + x2) // 2
         height = y2 - y1
-        top = y1 + max(40, int(height * 0.35))
-        bottom = y1 + min(height - 40, int(height * 0.65))
-        if bottom <= top:
+        long_top = y1 + max(40, int(height * 0.20))
+        long_bottom = y1 + min(height - 40, int(height * 0.85))
+        if long_bottom <= long_top:
             return False
         if down:
-            self.adb.swipe(x, top, x, bottom, 700)
+            # Returning to the top is asymmetric on OPPO chart pages: a
+            # gesture beginning in the chart is consumed by its ViewPager.
+            # Start and finish in the lower detail-card region; the caller's
+            # fingerprint loop repeats this shorter move until stable.
+            if local_id(node) in {"content_scroll_view", "coordinator_layout"}:
+                card_start = y1 + min(height - 80, int(height * 0.72))
+                card_end = y1 + min(height - 40, int(height * 0.94))
+                if card_end <= card_start:
+                    return False
+                self.adb.swipe(x, card_start, x, card_end, 500)
+            else:
+                # Ordinary lists/home feeds have no nested chart and can use
+                # the full reverse gesture to reach the top quickly.
+                self.adb.swipe(x, long_top, x, long_bottom, 700)
         else:
-            self.adb.swipe(x, bottom, x, top, 700)
+            # Moving toward lower content works best as a long gesture whose
+            # starting point is below the embedded chart.
+            if local_id(node) == "coordinator_layout":
+                feed_start = y1 + min(height - 40, int(height * 0.65))
+                feed_end = y1 + max(40, int(height * 0.35))
+                if feed_start <= feed_end:
+                    return False
+                self.adb.swipe(x, feed_start, x, feed_end, 700)
+            else:
+                self.adb.swipe(x, long_bottom, x, long_top, 700)
         return True
 
     def _capture_chart_crops(

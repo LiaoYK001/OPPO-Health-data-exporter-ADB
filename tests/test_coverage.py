@@ -53,6 +53,54 @@ def test_coverage_merges_ui_evidence_without_downgrading_exact_source(
     db.close()
 
 
+def test_no_data_day_keeps_semantic_status_after_ui_evidence(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "health.sqlite3", tmp_path / "private")
+    source_id, run_id = _source_and_run(db)
+    day = "2026-07-01"
+
+    db.set_coverage(
+        source_id,
+        "heart_rate",
+        day,
+        "no_data",
+        {
+            "database": False,
+            "ui": False,
+            "no_data": True,
+            "basis": "exact_source_absence",
+        },
+        run_id,
+    )
+    db.set_coverage(
+        source_id,
+        "heart_rate",
+        day,
+        "no_data",
+        {
+            "database": False,
+            "ui": True,
+            "no_data": True,
+            "basis": "exact_source_absence_with_ui_evidence",
+        },
+        run_id,
+    )
+    row = db.connection.execute(
+        "SELECT status, detail_json FROM coverage WHERE source_id=? AND local_date=?",
+        (source_id, day),
+    ).fetchone()
+
+    assert row["status"] == "no_data"
+    assert json.loads(row["detail_json"]) == {
+        "basis": "exact_source_absence_with_ui_evidence",
+        "database": False,
+        "no_data": True,
+        "ui": True,
+    }
+    db.close()
+
+
 def test_coverage_repair_restores_best_fidelity_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

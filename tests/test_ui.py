@@ -14,6 +14,95 @@ from health_exporter.ui import (
 )
 
 
+def test_scrollable_prefers_vertical_scrollview_over_larger_viewpager() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node class="androidx.viewpager.widget.ViewPager" scrollable="true"
+                bounds="[0,100][1440,2560]" resource-id="viewpager"/>
+          <node class="android.widget.ScrollView" scrollable="true"
+                bounds="[0,700][1440,2560]" resource-id="content_scroll"/>
+          <node class="androidx.recyclerview.widget.RecyclerView" scrollable="true"
+                bounds="[64,2000][1376,2560]" resource-id="details"/>
+        </hierarchy>
+        """
+    )
+
+    selected = UiTree(root).scrollable()
+
+    assert selected is not None
+    assert selected.attrib["resource-id"] == "content_scroll"
+
+
+def test_vertical_swipe_uses_long_span_to_avoid_embedded_chart() -> None:
+    node = ET.fromstring(
+        '<node class="android.widget.ScrollView" scrollable="true" '
+        'resource-id="content_scroll_view" bounds="[0,700][1440,2500]"/>'
+    )
+
+    class FakeAdb:
+        calls: list[tuple[int, int, int, int, int]] = []
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration_ms: int
+        ) -> None:
+            self.calls.append((x1, y1, x2, y2, duration_ms))
+
+    collector = object.__new__(UiCollector)
+    collector.adb = FakeAdb()  # type: ignore[assignment]
+
+    assert collector._swipe_scrollable(node, down=False) is True
+    assert collector._swipe_scrollable(node, down=True) is True
+    assert collector.adb.calls == [
+        (720, 2230, 720, 1060, 700),
+        (720, 1996, 720, 2392, 500),
+    ]
+
+
+def test_ordinary_list_uses_long_reverse_swipe_to_return_top() -> None:
+    node = ET.fromstring(
+        '<node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" '
+        'bounds="[0,100][1000,2100]"/>'
+    )
+
+    class FakeAdb:
+        call: tuple[int, int, int, int, int] | None = None
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration_ms: int
+        ) -> None:
+            self.call = (x1, y1, x2, y2, duration_ms)
+
+    collector = object.__new__(UiCollector)
+    collector.adb = FakeAdb()  # type: ignore[assignment]
+
+    assert collector._swipe_scrollable(node, down=True) is True
+    assert collector.adb.call == (500, 500, 500, 1800, 700)
+
+
+def test_health_home_coordinator_uses_nested_card_reverse_swipe() -> None:
+    node = ET.fromstring(
+        '<node class="android.widget.ScrollView" scrollable="true" '
+        'resource-id="coordinator_layout" bounds="[0,0][1440,2333]"/>'
+    )
+
+    class FakeAdb:
+        call: tuple[int, int, int, int, int] | None = None
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration_ms: int
+        ) -> None:
+            self.call = (x1, y1, x2, y2, duration_ms)
+
+    collector = object.__new__(UiCollector)
+    collector.adb = FakeAdb()  # type: ignore[assignment]
+
+    assert collector._swipe_scrollable(node, down=True) is True
+    assert collector.adb.call == (720, 1679, 720, 2193, 500)
+    assert collector._swipe_scrollable(node, down=False) is True
+    assert collector.adb.call == (720, 1516, 720, 816, 700)
+
+
 def test_scroll_to_top_returns_exact_xml_for_first_viewport(tmp_path: Path) -> None:
     xml = (
         b'<?xml version="1.0" encoding="UTF-8"?>'
@@ -133,8 +222,32 @@ def test_subpage_search_stops_when_scroll_does_not_change_ui() -> None:
     collector._swipe_scrollable = swipe  # type: ignore[method-assign]
 
     assert collector._open_text_target("睡眠基准心率") is False
-    assert dump_calls == 1
+    assert dump_calls == 2
     assert swipe_calls == 1
+
+
+def test_subpage_search_taps_current_visible_state_before_scrolling() -> None:
+    root = ET.fromstring(
+        '<hierarchy><node text="target" clickable="true" '
+        'bounds="[10,20][30,40]"/></hierarchy>'
+    )
+    tree = UiTree(root)
+
+    class FakeAdb:
+        tapped: tuple[int, int] | None = None
+
+        def tap(self, x: int, y: int) -> None:
+            self.tapped = (x, y)
+
+    collector = object.__new__(UiCollector)
+    collector.adb = FakeAdb()  # type: ignore[assignment]
+    collector.dump_tree = lambda _directory, _stem: (tree, Path("unused.xml"))  # type: ignore[method-assign]
+    collector._scroll_to_top = lambda max_swipes=8: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("visible fast path must not scroll")
+    )
+
+    assert collector._open_text_target("target") is True
+    assert collector.adb.tapped == (20, 30)
 
 
 def test_resume_navigation_batches_clicks_and_verifies_actual_date(tmp_path: Path) -> None:

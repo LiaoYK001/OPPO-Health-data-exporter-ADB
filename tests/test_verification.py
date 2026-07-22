@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
+from health_exporter.artifacts import ArtifactStore
 from health_exporter.constants import UI_PROFILES
 from health_exporter.db import Database
 from health_exporter.verification import (
@@ -10,6 +12,7 @@ from health_exporter.verification import (
     _activity_ui_summary,
     _display_dates,
     _heart_ui_summary,
+    _heart_main_scroll_state,
     _round_for_display,
     _sleep_ui_summary,
     _spo2_ui_summary,
@@ -101,6 +104,61 @@ def test_heart_ui_summary_reads_exact_visible_integers() -> None:
         "resting_bpm": 67,
         "walking_average_bpm": 108,
     }
+
+
+def test_heart_ui_summary_preserves_visible_no_data_placeholder() -> None:
+    payload = {
+        "viewports": [
+            {
+                "nodes": [
+                    {"text": "步行平均心率"},
+                    {"text": "--次/分"},
+                ]
+            }
+        ]
+    }
+
+    assert _heart_ui_summary(payload) == {
+        "walking_average_bpm": None,
+        "walking_average_bpm__placeholder": "--",
+    }
+
+
+def test_heart_main_scroll_requires_top_chart_and_bottom_card_viewports() -> None:
+    complete = {
+        "viewports": [
+            {
+                "nodes": [
+                    {
+                        "resource_id": "view_heart_rate_day",
+                        "bounds": "[0,723][1440,1859]",
+                    }
+                ]
+            },
+            {"nodes": [{"text": "睡眠基准心率"}]},
+        ]
+    }
+    bottom_only = {
+        "viewports": [
+            {
+                "nodes": [
+                    {
+                        "resource_id": "view_heart_rate_day",
+                        "bounds": "[0,723][1440,1381]",
+                    },
+                    {"text": "睡眠基准心率"},
+                ]
+            }
+        ]
+    }
+
+    assert _heart_main_scroll_state(complete) == {
+        "viewport_count": 2,
+        "max_chart_height": 1136,
+        "has_sleep_baseline_card": True,
+        "complete": True,
+    }
+    assert _heart_main_scroll_state(bottom_only)["complete"] is False
 
 
 def test_weight_ui_summary_uses_visible_precision() -> None:
@@ -291,7 +349,23 @@ def test_inflight_subpage_is_pending_but_finished_run_is_incomplete(
         timezone="Asia/Shanghai",
     )
     run_id = db.start_run(source_id, "collect", "fixture", "fixture", {})
-    db.add_page_capture(
+    artifacts = ArtifactStore(tmp_path, db)
+    screenshot = artifacts.put_bytes(
+        b"fixture screenshot",
+        suffix=".png",
+        media_type="image/png",
+    )
+    xml = artifacts.put_bytes(
+        b"<hierarchy/>",
+        suffix=".xml",
+        media_type="application/xml",
+    )
+    mosaic = artifacts.put_bytes(
+        b"fixture mosaic",
+        suffix=".png",
+        media_type="image/png",
+    )
+    capture_id = db.add_page_capture(
         source_id=source_id,
         run_id=run_id,
         metric="heart_rate",
@@ -303,6 +377,9 @@ def test_inflight_subpage_is_pending_but_finished_run_is_incomplete(
         display_payload={
             "viewports": [
                 {
+                    "index": 0,
+                    "screenshot_sha256": screenshot.sha256,
+                    "xml_sha256": xml.sha256,
                     "nodes": [
                         {"text": "7月02日", "resource_id": "tv_date"},
                         {"text": "静息心率", "resource_id": ""},
@@ -313,6 +390,9 @@ def test_inflight_subpage_is_pending_but_finished_run_is_incomplete(
         capture_hash="fixture-main-page",
         fidelity="exact_ui",
     )
+    db.link_evidence(capture_id, mosaic.sha256, "page_mosaic")
+    db.link_evidence(capture_id, screenshot.sha256, "viewport_png", 0)
+    db.link_evidence(capture_id, xml.sha256, "ui_xml", 0)
     db.connection.commit()
 
     running_report = Verifier(db, tmp_path).verify(
@@ -321,6 +401,39 @@ def test_inflight_subpage_is_pending_but_finished_run_is_incomplete(
     )
     assert running_report["passed"] is True
     assert running_report["subpage_validation"]["pending_main_pages"] == 1
+    assert running_report["page_evidence_validation"] == {
+        "pages": 1,
+        "viewports": 1,
+        "links_checked": 3,
+        "missing": 0,
+        "ambiguous": 0,
+        "invalid_payload": 0,
+    }
+    assert running_report["subpage_validation"]["source_required"] == 0
+    assert running_report["artifact_store_validation"] == {
+        "registered_files": 3,
+        "content_files": 3,
+        "orphan_files": 0,
+        "invalid_locations": 0,
+    }
+
+    db.connection.execute(
+        "DELETE FROM evidence_links WHERE page_capture_id=? AND role='page_mosaic'",
+        (capture_id,),
+    )
+    db.connection.commit()
+    missing_evidence_report = Verifier(db, tmp_path).verify(
+        source_id=source_id,
+        verify_all_artifacts=False,
+    )
+    assert missing_evidence_report["passed"] is False
+    assert any(
+        item["type"] == "page_evidence_missing"
+        and item["role"] == "page_mosaic"
+        for item in missing_evidence_report["failures"]
+    )
+    db.link_evidence(capture_id, mosaic.sha256, "page_mosaic")
+    db.connection.commit()
 
     db.finish_run(run_id, "complete")
     finished_report = Verifier(db, tmp_path).verify(
@@ -331,4 +444,140 @@ def test_inflight_subpage_is_pending_but_finished_run_is_incomplete(
     assert finished_report["passed"] is False
     assert "main_page_incomplete" in failure_types
     assert "subpage_capture_missing" in failure_types
+    db.close()
+
+
+def test_strict_verifier_rejects_unregistered_content_store_file(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "health.sqlite3", tmp_path / "private")
+    installation = db.pseudonymize("fixture")
+    source_id = db.ensure_source(
+        vendor="oppo",
+        app_package="com.heytap.health",
+        app_version="fixture",
+        installation_hash=installation,
+        account_hash="unknown:fixture",
+        timezone="Asia/Shanghai",
+    )
+    orphan = tmp_path / "artifacts" / "sha256" / "aa" / ("a" * 64 + ".bin")
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(b"not registered")
+
+    report = Verifier(db, tmp_path).verify(
+        source_id=source_id,
+        verify_all_artifacts=True,
+    )
+
+    assert report["passed"] is False
+    assert report["artifact_store_validation"]["orphan_files"] == 1
+    assert any(item["type"] == "artifact_orphan_files" for item in report["failures"])
+    db.close()
+
+
+def test_strict_verifier_validates_completed_snapshot_manifest(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "health.sqlite3", tmp_path / "private")
+    installation = db.pseudonymize("fixture")
+    source_id = db.ensure_source(
+        vendor="oppo",
+        app_package="com.heytap.health",
+        app_version="fixture",
+        installation_hash=installation,
+        account_hash="unknown:fixture",
+        timezone="Asia/Shanghai",
+    )
+    artifacts = ArtifactStore(tmp_path, db)
+    raw_view = tmp_path / "raw" / "oppo" / "fixture" / "database.db"
+    raw_view.parent.mkdir(parents=True)
+    raw_view.write_bytes(b"fixture snapshot")
+    raw_artifact = artifacts.put_file(
+        raw_view, media_type="application/vnd.sqlite3"
+    )
+    run_id = db.start_run(source_id, "snapshot-source", "fixture", "fixture", {})
+    db.add_raw_snapshot(
+        run_id=run_id,
+        source_path="/data/user/0/fixture/databases/database.db",
+        artifact_sha256=raw_artifact.sha256,
+        sqlite_status="encrypted_or_non_sqlite",
+        schema_hash=None,
+        table_count=None,
+        row_count=None,
+    )
+    manifest = {
+        "run_id": run_id,
+        "files": [
+            {
+                "remote_path": "/data/user/0/fixture/databases/database.db",
+                "local_path": raw_view.relative_to(tmp_path).as_posix(),
+                "sha256": raw_artifact.sha256,
+                "sqlite_status": "encrypted_or_non_sqlite",
+                "tables": [],
+            }
+        ],
+    }
+    manifest_path = tmp_path / "manifests" / f"oppo-snapshot-{run_id}.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifacts.put_file(manifest_path, media_type="application/json")
+    db.finish_run(run_id, "complete")
+
+    report = Verifier(db, tmp_path).verify(
+        source_id=source_id,
+        verify_all_artifacts=True,
+    )
+
+    assert report["passed"] is True
+    assert report["raw_snapshot_validation"] == {
+        "completed_runs": 1,
+        "manifests_checked": 1,
+        "manifest_artifacts_checked": 1,
+        "files_checked": 1,
+        "issues": 0,
+    }
+    db.close()
+
+
+def test_verifier_rejects_unknown_inventory_cards(tmp_path: Path) -> None:
+    db = Database(tmp_path / "health.sqlite3", tmp_path / "private")
+    installation = db.pseudonymize("fixture")
+    source_id = db.ensure_source(
+        vendor="oppo",
+        app_package="com.heytap.health",
+        app_version="fixture",
+        installation_hash=installation,
+        account_hash="unknown:fixture",
+        timezone="Asia/Shanghai",
+    )
+    artifacts = ArtifactStore(tmp_path, db)
+    xml = artifacts.put_bytes(
+        b"<hierarchy/>", suffix=".xml", media_type="application/xml"
+    )
+    run_id = db.start_run(source_id, "inventory", "fixture", "fixture", {})
+    manifest = {
+        "run_id": run_id,
+        "ui": {
+            "cards": ["new raw metric"],
+            "included": [],
+            "excluded": [],
+            "unknown": ["new raw metric"],
+            "views": [{"index": 0, "xml_sha256": xml.sha256}],
+        },
+    }
+    manifest_path = tmp_path / "manifests" / f"inventory-{run_id}.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifacts.put_file(manifest_path, media_type="application/json")
+    db.finish_run(run_id, "partial")
+
+    report = Verifier(db, tmp_path).verify(
+        source_id=source_id,
+        verify_all_artifacts=False,
+    )
+
+    assert report["passed"] is False
+    assert report["inventory_validation"]["unknown"] == 1
+    assert report["inventory_validation"]["view_xml_artifacts_checked"] == 1
+    assert any(item["type"] == "inventory_unknown_cards" for item in report["failures"])
     db.close()

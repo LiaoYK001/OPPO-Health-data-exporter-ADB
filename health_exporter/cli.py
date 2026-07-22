@@ -75,6 +75,41 @@ class Runtime:
                 account_hash=f"unknown:{installation_hash[:16]}",
                 timezone=DEFAULT_TIMEZONE,
             )
+            self._register_device()
+
+    def _register_device(self) -> None:
+        if self.adb is None or self.source_id is None:
+            return
+
+        def shell_value(*command: str) -> str:
+            value = self.adb.shell(*command, check=False).strip()
+            return "" if value.lower() in {"", "null", "unknown"} else value
+
+        android_id = shell_value("settings", "get", "secure", "android_id")
+        device_serial = shell_value("getprop", "ro.serialno")
+        stable_id = android_id or device_serial or self.args.serial
+        metadata = {
+            "platform": "android",
+            "android_release": shell_value("getprop", "ro.build.version.release"),
+            "android_sdk": shell_value("getprop", "ro.build.version.sdk"),
+            "brand": shell_value("getprop", "ro.product.brand"),
+            "manufacturer": shell_value("getprop", "ro.product.manufacturer"),
+            "model": shell_value("getprop", "ro.product.model"),
+            "product": shell_value("getprop", "ro.product.name"),
+            "primary_abi": shell_value("getprop", "ro.product.cpu.abi"),
+            "build_fingerprint_hash": self.db.pseudonymize(
+                shell_value("getprop", "ro.build.fingerprint")
+            ),
+            "adb_serial_hash": self.db.pseudonymize(self.args.serial),
+            "identity_basis": (
+                "android_id" if android_id else "device_serial" if device_serial else "adb_serial"
+            ),
+        }
+        self.db.upsert_device(
+            source_id=self.source_id,
+            device_hash=self.db.pseudonymize(f"android-device:{stable_id}"),
+            metadata=metadata,
+        )
 
     def close(self) -> None:
         self.db.close()
@@ -386,6 +421,21 @@ def _parse_metrics(value: str) -> list[str]:
     return result
 
 
+def _collection_issues(
+    unknown_cards: list[str],
+    ui_results: list[dict[str, Any]],
+) -> list[str]:
+    issues = [f"unmapped_card:{title}" for title in unknown_cards]
+    for item in ui_results:
+        metric = str(item.get("metric") or "unknown")
+        if item.get("failed"):
+            issues.append(f"{metric}:exception:{item['failed']}")
+        failure_count = int(item.get("failures") or 0)
+        if failure_count:
+            issues.append(f"{metric}:failed_days:{failure_count}")
+    return issues
+
+
 def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
     with Runtime(args, require_adb=True) as runtime:
         adb, source_id = runtime.require_device()
@@ -494,14 +544,15 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                         else dt.date.today()
                     )
                     try:
-                        capture_result = collector.capture_history(
-                                metric,
-                                earliest_date=earliest,
-                                max_days=args.max_days,
-                                resume=args.resume,
-                                capture_subpages=not args.no_subpages,
-                                max_scrolls=args.max_scrolls,
-                            )
+                        capture_result = adapter.capture(
+                            collector,
+                            metric,
+                            earliest_date=earliest,
+                            max_days=args.max_days,
+                            resume=args.resume,
+                            capture_subpages=not args.no_subpages,
+                            max_scrolls=args.max_scrolls,
+                        )
                         ui_results.append(capture_result)
                         if capture_result["failures"] == 0 and capture_result["captured"] > 0:
                             runtime.db.resolve_failures(
@@ -525,6 +576,26 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
             result["coverage_reconcile"] = runtime.db.reconcile_no_data_coverage(
                 source_id, run_id, PRIMARY_METRICS
             )
+            collection_issues = _collection_issues(
+                list(home["unknown"]),
+                result.get("ui", []),
+            )
+            if collection_issues:
+                result["incomplete"] = collection_issues
+                raise ExporterError(
+                    "采集存在未完成项：" + "; ".join(collection_issues)
+                )
+            runtime.db.resolve_failures(
+                source_id,
+                stage="collect",
+                resolution=f"后续 collect 全部目标完成：{run_id}",
+            )
+            if not home["unknown"]:
+                runtime.db.resolve_failures(
+                    source_id,
+                    stage="inventory",
+                    resolution=f"后续首页 inventory 未发现未知卡片：{run_id}",
+                )
             runtime.db.finish_run(run_id, "complete")
             return result
         except KeyboardInterrupt:

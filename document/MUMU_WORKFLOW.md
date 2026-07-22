@@ -86,7 +86,7 @@ python .\ohealth_exporter.py collect --ui-only --all-history --resume
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\continue_after_heart.ps1 -HeartProcessId <心率采集PID>
 ```
 
-监督脚本会在心率采集器异常退出时从 SQLite checkpoint 自动续跑，默认最多重试 3 次，并且不会重启 OPPO 健康。心率正常退出且 checkpoint 已到 SQLite 中该数据源的最早心率日期后，才会继续活动、睡眠、血氧、血压、体重和压力，并最终执行校验与 CSV/XLSX 导出；否则停止排队并记录原因。运行日志位于 `data/logs/`。
+监督脚本会在心率或后续多指标采集异常退出时从 SQLite checkpoint 自动续跑，默认每个阶段最多重试 3 次，并且不会重启 OPPO 健康。心率正常退出且 checkpoint 已到 SQLite 中该数据源的最早心率日期后，才会继续活动、睡眠、血氧、血压、体重和压力。采集结束后，校验与 CSV/XLSX 导出分开执行，因此即使完整校验报告仍列出待解决缺口，日级表格也会照常生成。运行日志位于 `data/logs/`。
 
 如需人工停止无人值守任务，先创建 `data\STOP_UI_COLLECTION`，再结束采集器进程；监督脚本看到该标志后不会重新拉起采集器。恢复前删除该标志文件。
 

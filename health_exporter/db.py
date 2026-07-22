@@ -458,6 +458,36 @@ class Database:
         self.connection.commit()
         return account_hash
 
+    def upsert_device(
+        self,
+        *,
+        source_id: int,
+        device_hash: str,
+        metadata: dict[str, Any],
+    ) -> int:
+        """Register a normalized device without storing its raw stable ID."""
+        self.connection.execute(
+            """
+            INSERT INTO devices(
+                source_id, device_hash, metadata_json, created_at
+            ) VALUES(?,?,?,?)
+            ON CONFLICT(source_id, device_hash) DO UPDATE SET
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                source_id,
+                device_hash,
+                canonical_json(metadata),
+                utc_now(),
+            ),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT id FROM devices WHERE source_id=? AND device_hash=?",
+            (source_id, device_hash),
+        ).fetchone()
+        return int(row["id"])
+
     def start_run(
         self,
         source_id: int,
@@ -913,6 +943,8 @@ class Database:
             )
         if merged_detail.get("database"):
             final_status = "exact_source"
+        elif merged_detail.get("no_data"):
+            final_status = "no_data"
         elif merged_detail.get("ui"):
             final_status = "exact_ui"
         self.connection.execute(
@@ -960,6 +992,8 @@ class Database:
                 desired = str(row["status"])
                 if detail.get("database"):
                     desired = "exact_source"
+                elif detail.get("no_data"):
+                    desired = "no_data"
                 elif detail.get("ui"):
                     desired = "exact_ui"
                 if desired == row["status"]:
@@ -1025,6 +1059,7 @@ class Database:
                                 {
                                     "database": False,
                                     "ui": False,
+                                    "no_data": True,
                                     "basis": "exact_source_absence",
                                 },
                                 run_id,

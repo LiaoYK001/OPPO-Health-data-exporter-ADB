@@ -15,6 +15,92 @@ from .constants import PRIMARY_METRICS
 from .db import Database
 
 
+DAILY_BASE_COLUMNS = ["source_id", "date", "revision", "fidelity", "partial"]
+TABLE_BASE_COLUMNS: dict[str, list[str]] = {
+    "daily_overview": ["source_id", "date", "partial"],
+    "activity_daily": DAILY_BASE_COLUMNS
+    + [
+        "steps",
+        "distance_m",
+        "active_energy_kcal",
+        "workout_minutes",
+        "active_count",
+        "elevation_gain_m",
+        "steps_goal",
+        "energy_goal_kcal",
+        "workout_goal_minutes",
+        "active_count_goal",
+    ],
+    "heart_rate_daily": DAILY_BASE_COLUMNS
+    + [
+        "min_bpm",
+        "max_bpm",
+        "average_bpm",
+        "resting_bpm",
+        "walking_average_bpm",
+        "sleep_baseline_bpm",
+    ],
+    "sleep_daily": DAILY_BASE_COLUMNS
+    + [
+        "sleep_start_utc_ms",
+        "sleep_end_utc_ms",
+        "total_sleep_raw",
+        "deep_sleep_raw",
+        "light_sleep_raw",
+        "rem_sleep_raw",
+        "awake_raw",
+        "wake_count",
+        "sleep_score",
+    ],
+    "spo2_daily": DAILY_BASE_COLUMNS
+    + [
+        "min_percent",
+        "max_percent",
+        "average_percent",
+        "drop_count",
+        "low_total_time_raw",
+    ],
+    "blood_pressure_daily": DAILY_BASE_COLUMNS
+    + [
+        "min_systolic_mmhg",
+        "max_systolic_mmhg",
+        "average_systolic_mmhg",
+        "min_diastolic_mmhg",
+        "max_diastolic_mmhg",
+        "average_diastolic_mmhg",
+        "normal_count",
+        "high_count",
+        "low_count",
+    ],
+    "weight_daily": DAILY_BASE_COLUMNS
+    + [
+        "latest_measurement_utc_ms",
+        "latest_weight_kg",
+        "latest_bmi",
+        "measurement_count",
+    ],
+    "stress_daily": DAILY_BASE_COLUMNS
+    + [
+        "min",
+        "max",
+        "average",
+        "max_timestamp_utc_ms",
+        "relaxed_duration_raw",
+        "normal_duration_raw",
+        "medium_duration_raw",
+        "high_duration_raw",
+    ],
+    "coverage": [
+        "source_id",
+        "canonical_metric",
+        "local_date",
+        "status",
+        "detail_json",
+        "updated_at",
+    ],
+}
+
+
 def _flatten(
     value: Any,
     prefix: str = "",
@@ -100,15 +186,21 @@ class DailyExporter:
             for key, value in flattened.items():
                 if key.startswith("computed_from_samples.") or "." not in key:
                     overview[f"{metric}.{key}"] = value
+        coverage_where = "WHERE source_id=?" if source_id is not None else ""
+        coverage_parameters: tuple[Any, ...] = (
+            (source_id,) if source_id is not None else ()
+        )
         coverage = [
             dict(row)
             for row in self.db.connection.execute(
-                """
+                f"""
                 SELECT source_id, canonical_metric, local_date, status,
                        detail_json, updated_at
                 FROM coverage
+                {coverage_where}
                 ORDER BY source_id, local_date, canonical_metric
-                """
+                """,
+                coverage_parameters,
             )
         ]
         return {
@@ -134,7 +226,7 @@ class DailyExporter:
         if "csv" in formats:
             for name, rows in tables.items():
                 path = target / f"{name}.csv"
-                self._write_csv(path, rows)
+                self._write_csv(path, name, rows)
                 outputs.append(str(path.resolve()))
         if "xlsx" in formats:
             path = target / "health_daily.xlsx"
@@ -152,29 +244,30 @@ class DailyExporter:
         return manifest
 
     @staticmethod
-    def _columns(rows: list[dict[str, Any]]) -> list[str]:
-        preferred = ["source_id", "date", "revision", "fidelity", "partial"]
+    def _columns(table_name: str, rows: list[dict[str, Any]]) -> list[str]:
+        preferred = TABLE_BASE_COLUMNS.get(table_name, DAILY_BASE_COLUMNS)
         discovered = {key for row in rows for key in row}
-        return [key for key in preferred if key in discovered] + sorted(discovered - set(preferred))
+        return list(preferred) + sorted(discovered - set(preferred))
 
-    def _write_csv(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        columns = self._columns(rows)
+    def _write_csv(
+        self,
+        path: Path,
+        table_name: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        columns = self._columns(table_name, rows)
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
-            if columns:
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow({key: _safe_cell(value) for key, value in row.items()})
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: _safe_cell(value) for key, value in row.items()})
 
     def _write_xlsx(self, path: Path, tables: dict[str, list[dict[str, Any]]]) -> None:
         workbook = Workbook(write_only=False)
         workbook.remove(workbook.active)
         for name, rows in tables.items():
             sheet = workbook.create_sheet(_sheet_name(name))
-            columns = self._columns(rows)
-            if not columns:
-                sheet.append(["no_data"])
-                continue
+            columns = self._columns(name, rows)
             sheet.append(columns)
             for cell in sheet[1]:
                 cell.font = Font(bold=True)

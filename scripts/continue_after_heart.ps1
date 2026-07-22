@@ -149,12 +149,9 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$Stdout = Join-Path $LogDir "remaining-history-$Stamp.out.log"
-$Stderr = Join-Path $LogDir "remaining-history-$Stamp.err.log"
-$Arguments = @(
+$RemainingArguments = @(
     '.\ohealth_exporter.py',
-    'run',
+    'collect',
     '--ui-only',
     '--metrics',
     'activity,sleep,spo2,blood_pressure,weight,stress',
@@ -164,8 +161,52 @@ $Arguments = @(
     '20'
 )
 
-Write-SupervisorLog "starting remaining UI history; stdout=$Stdout stderr=$Stderr"
-& $Python @Arguments 1> $Stdout 2> $Stderr
-$RemainingExitCode = $LASTEXITCODE
-Write-SupervisorLog "remaining UI history exited code=$RemainingExitCode"
-exit $RemainingExitCode
+$RemainingAttempt = 0
+while ($true) {
+    $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $Stdout = Join-Path $LogDir "remaining-history-$Stamp.out.log"
+    $Stderr = Join-Path $LogDir "remaining-history-$Stamp.err.log"
+    Write-SupervisorLog "starting remaining UI history attempt=$RemainingAttempt/$MaxHeartRestarts; stdout=$Stdout stderr=$Stderr"
+    & $Python @RemainingArguments 1> $Stdout 2> $Stderr
+    $RemainingExitCode = $LASTEXITCODE
+    Write-SupervisorLog "remaining UI history attempt=$RemainingAttempt exited code=$RemainingExitCode"
+    if ($RemainingExitCode -eq 0) {
+        break
+    }
+    if (Test-Path -LiteralPath $StopFile) {
+        Write-SupervisorLog "stop marker present; remaining UI history will not restart: $StopFile"
+        exit $RemainingExitCode
+    }
+    if ($RemainingAttempt -ge $MaxHeartRestarts) {
+        Write-SupervisorLog 'remaining UI history retry limit was reached'
+        exit $RemainingExitCode
+    }
+    $RemainingAttempt += 1
+}
+
+$FinalRepairStdout = Join-Path $LogDir 'repair-normalized-final.out.log'
+$FinalRepairStderr = Join-Path $LogDir 'repair-normalized-final.err.log'
+Write-SupervisorLog "running final normalized repair; stdout=$FinalRepairStdout stderr=$FinalRepairStderr"
+& $Python '.\ohealth_exporter.py' 'repair-normalized' 1> $FinalRepairStdout 2> $FinalRepairStderr
+if ($LASTEXITCODE -ne 0) {
+    Write-SupervisorLog "final normalized repair failed code=$LASTEXITCODE"
+    exit $LASTEXITCODE
+}
+
+$VerifyStdout = Join-Path $LogDir 'verification-final.out.log'
+$VerifyStderr = Join-Path $LogDir 'verification-final.err.log'
+Write-SupervisorLog "running full verification; stdout=$VerifyStdout stderr=$VerifyStderr"
+& $Python '.\ohealth_exporter.py' 'verify' 1> $VerifyStdout 2> $VerifyStderr
+$VerifyExitCode = $LASTEXITCODE
+Write-SupervisorLog "full verification exited code=$VerifyExitCode"
+
+$ExportStdout = Join-Path $LogDir 'export-final.out.log'
+$ExportStderr = Join-Path $LogDir 'export-final.err.log'
+Write-SupervisorLog "exporting CSV/XLSX; stdout=$ExportStdout stderr=$ExportStderr"
+& $Python '.\ohealth_exporter.py' 'export' '--format' 'both' 1> $ExportStdout 2> $ExportStderr
+$ExportExitCode = $LASTEXITCODE
+Write-SupervisorLog "CSV/XLSX export exited code=$ExportExitCode"
+if ($ExportExitCode -ne 0) {
+    exit $ExportExitCode
+}
+exit $VerifyExitCode

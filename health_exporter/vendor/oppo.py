@@ -232,7 +232,7 @@ class OppoAdapter(VendorAdapter):
                             "primary_keys": primary_keys,
                         }
                     )
-        result = normalizer.finalize()
+        result = self.normalize(normalizer)
         result["inspected"] = inspected
         result["encrypted_files"] = [
             item.remote_path
@@ -241,6 +241,43 @@ class OppoAdapter(VendorAdapter):
             and not item.remote_path.endswith(("-wal", "-shm"))
         ]
         return result
+
+    def normalize(self, normalizer: Any) -> dict[str, Any]:
+        if not isinstance(normalizer, OppoNormalizer):
+            raise TypeError("OPPO adapter requires OppoNormalizer")
+        return normalizer.finalize()
+
+    def capture(
+        self,
+        collector: Any,
+        metric: str,
+        *,
+        earliest_date: dt.date,
+        max_days: int | None,
+        resume: bool,
+        capture_subpages: bool,
+        max_scrolls: int,
+    ) -> dict[str, Any]:
+        return collector.capture_history(
+            metric,
+            earliest_date=earliest_date,
+            max_days=max_days,
+            resume=resume,
+            capture_subpages=capture_subpages,
+            max_scrolls=max_scrolls,
+        )
+
+    def verify(
+        self,
+        verifier: Any,
+        *,
+        source_id: int | None,
+        verify_all_artifacts: bool,
+    ) -> dict[str, Any]:
+        return verifier.verify(
+            source_id=source_id,
+            verify_all_artifacts=verify_all_artifacts,
+        )
 
     @staticmethod
     def _primary_keys(connection: sqlite3.Connection, table: str) -> list[str]:

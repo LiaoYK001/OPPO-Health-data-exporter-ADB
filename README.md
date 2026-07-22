@@ -49,6 +49,12 @@ python .\ohealth_exporter.py export --format both
 
 CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇总；日内采样点、睡眠阶段区间、原始 vendor 字段和页面证据保留在 SQLite/素材库中。
 
+## 跨厂商适配边界
+
+`VendorAdapter` 强制实现 `discover / snapshot / extract / normalize / capture / verify` 六个阶段。OPPO 当前使用同一接口连接 Root 快照、规范化、ADB 页面状态机和验真器；以后接入小米或华为时新增适配器即可。`sources` 通过 `vendor` 区分来源，指标、采样点、区间、日汇总、覆盖状态和素材关系等核心表没有 OPPO 专属必填字段。按 `source_id` 导出时，日表和 coverage 均会严格过滤该来源。
+
+连接设备时会把 Android 版本、型号、ABI 等非账号元数据写入 `devices`，Android ID、ADB 序列号和构建指纹只以项目私有盐的 HMAC 保存，不落明文。严格验真还会反向扫描 `data/artifacts/sha256`：除校验数据库登记素材的大小与 SHA-256 外，未登记的孤儿文件和不符合内容寻址目录规则的文件也会阻止最终验收。
+
 完整状态、故障处理和验收边界见 [MuMu 操作流程](document/MUMU_WORKFLOW.md)。
 
 ## 开发验证
