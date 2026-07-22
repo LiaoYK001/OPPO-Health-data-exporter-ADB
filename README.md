@@ -37,7 +37,61 @@ python .\ohealth_exporter.py inventory
 python .\ohealth_exporter.py collect --ui-only --all-history --resume
 ```
 
-中断后重复最后一条命令即可续跑；当天会重新采集并生成新版本。
+#### 采集中断与 checkpoint
+
+采集器在每个日期完整处理并写入 SQLite 后更新 checkpoint。普通手工采集被 `Ctrl+C`、APP 退出或 ADB 暂时断开而中断时，重新执行上面的最后一条 `collect --ui-only --all-history --resume` 命令即可继续：
+
+- checkpoint 之前已经完成的历史日期会跳过，不会从头重新抓取；
+- 中断时尚未完整提交的日期可能重新采集一次，以保证页面证据完整；
+- 当天数据属于 `partial`，再次同步时会生成一个新版本，旧版本和旧素材不会被删除或覆盖。
+
+#### 电脑计划重启：先安全暂停
+
+电脑需要正常重启、关机或安装系统更新时，不要直接在任务管理器中结束 Python，也不要先关闭 MuMu。先在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collection.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+```
+
+暂停脚本会依次执行以下操作：
+
+1. 创建 `data\STOP_UI_COLLECTION`，防止监督脚本重新启动采集器；
+2. 先停止后续指标监督器，再停止当前页面采集器；
+3. 将当前采集批次标记为 `interrupted`，保留已经提交的 SQLite checkpoint；
+4. 在终端打印各指标已经到达的日期。
+
+只有看到下面两行成功提示后，才关闭 MuMu 或重启电脑：
+
+```text
+采集已安全暂停，checkpoint 已保存在 data\health.sqlite3。
+现在可以重启电脑。
+```
+
+如果暂停脚本报错，不要立即重启；保留终端输出并排查错误。脚本在成功完成前不会把已有采集数据删除。
+
+#### 开机后恢复采集
+
+按以下顺序操作：
+
+1. 启动 MuMu，等待 Android 系统和 ADB 完全就绪。
+2. 确认 MuMu 的 Root 已关闭。如果 Root 仍然开启，先关闭 Root，再打开 OPPO 健康，否则 APP 可能显示风险提示后退出。
+3. 不要改变 1440×2560 分辨率、640 密度、中文语言和深色模式。
+4. 打开 OPPO 健康，进入“健康”首页，等待卡片和当天数据加载完成。
+5. 在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+```
+
+恢复脚本会先检查 ADB 连接、显示配置、APP 版本、前台 APP、剩余磁盘空间及 Root 是否关闭。检查全部通过后，它才会删除 `STOP_UI_COLLECTION`，修复重启前遗留的运行状态，并从 SQLite checkpoint 恢复心率采集；心率完成后，监督脚本会自动衔接活动、睡眠、血氧、血压、体重和压力。
+
+看到“页面采集已从 SQLite checkpoint 继续”以及心率采集和后续指标调度的 PID 后，即表示恢复成功。之后保持 MuMu 和电脑运行，不要操作模拟器，也不要开启 Root。运行日志保存在 `data\logs\`。
+
+如果环境检查未通过，恢复脚本不会启动采集，也不会删除停止标志。根据终端提示修正 MuMu、Root 或 OPPO 健康状态后，重复执行恢复命令即可。
+
+#### 突然断电或来不及暂停
+
+如果电脑已经死机、断电或强制重启，无法提前执行暂停脚本，开机后仍按“开机后恢复采集”的步骤操作。恢复脚本会把没有对应存活进程的旧 `running` 批次改为 `interrupted`，再从最后一次成功提交的 checkpoint 继续。最坏情况下只会重新采集最后一个未完整提交的日期；已完成历史日期、原始证据和旧版本不会被覆盖。
 
 ### 校验和表格
 

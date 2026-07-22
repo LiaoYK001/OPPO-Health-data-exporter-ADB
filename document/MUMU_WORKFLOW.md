@@ -88,7 +88,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\continue_after_hea
 
 监督脚本会在心率或后续多指标采集异常退出时从 SQLite checkpoint 自动续跑，默认每个阶段最多重试 3 次，并且不会重启 OPPO 健康。心率正常退出且 checkpoint 已到 SQLite 中该数据源的最早心率日期后，才会继续活动、睡眠、血氧、血压、体重和压力。采集结束后，校验与 CSV/XLSX 导出分开执行，因此即使完整校验报告仍列出待解决缺口，日级表格也会照常生成。运行日志位于 `data/logs/`。
 
-如需人工停止无人值守任务，先创建 `data\STOP_UI_COLLECTION`，再结束采集器进程；监督脚本看到该标志后不会重新拉起采集器。恢复前删除该标志文件。
+如需因电脑重启而停止无人值守任务，不要手工结束 Python。请在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collection.ps1
+```
+
+脚本会先创建 `data\STOP_UI_COLLECTION`，停止监督器和采集器，把当前 run 标为 `interrupted`，并打印已提交的 SQLite checkpoint。看到“现在可以重启电脑”后再重启。
+
+开机后按以下顺序恢复：
+
+1. 启动 MuMu，确认 Root 关闭；不要改变 1440×2560/640、中文或深色模式。
+2. 打开 OPPO 健康，停留在“健康”首页并等待页面加载完成。
+3. 在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1
+```
+
+恢复脚本会先运行 UI 阶段环境检查，检查通过后才删除停止标志，并从 checkpoint 续跑心率及后续指标。若电脑突然断电、来不及执行暂停脚本，也直接按开机后的步骤恢复；遗留的 `running` 批次会被标为 `interrupted`，至多重抓最后一个未完整提交的日期。
 
 每个“指标 × 日期”会保存：
 
