@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>OPPO 健康采集监控</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL OBSERVABILITY CONSOLE</p>
+          <h1>OPPO 健康采集监控</h1>
+          <p class="subtitle">checkpoint、运行批次、失败记录与日志的本地只读视图</p>
+        </div>
+        <div class="topbar-actions">
+          <span id="updated-at" class="muted">等待首次刷新</span>
+          <button id="refresh" type="button">立即刷新</button>
+        </div>
+      </header>
+
+      <section id="system-strip" class="status-strip" aria-label="系统状态"></section>
+
+      <section class="summary-grid" aria-label="采集摘要">
+        <article class="summary-card accent"><span>采集状态</span><strong id="phase">—</strong><small id="run-detail">—</small></article>
+        <article class="summary-card"><span>页面证据</span><strong id="page-count">—</strong><small>page captures</small></article>
+        <article class="summary-card"><span>素材</span><strong id="artifact-count">—</strong><small id="artifact-size">—</small></article>
+        <article class="summary-card"><span>未解决失败</span><strong id="failure-count">—</strong><small>需要人工确认</small></article>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading">
+          <div><p class="eyebrow">HISTORY FRONTIER</p><h2>指标 checkpoint</h2></div>
+          <span class="muted">越早表示历史遍历越深入</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>指标</th><th>最后完成日</th><th>来源范围</th><th>页面日期</th><th>覆盖状态</th><th>更新时间</th></tr></thead>
+            <tbody id="metrics-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="two-column">
+        <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">RUN LEDGER</p><h2>最近运行批次</h2></div></div>
+          <div id="runs" class="timeline"></div>
+        </article>
+        <article class="panel danger-panel">
+          <div class="panel-heading"><div><p class="eyebrow">OPEN ISSUES</p><h2>未解决失败</h2></div><span id="failure-badge" class="badge danger">0</span></div>
+          <div id="failures" class="failure-list"></div>
+        </article>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading">
+          <div><p class="eyebrow">CALENDAR NAVIGATION PROOF</p><h2>日历直达验证</h2></div>
+          <span id="calendar-result" class="badge">等待证据</span>
+        </div>
+        <p id="calendar-copy" class="panel-copy"></p>
+        <div id="calendar-proof" class="proof-grid"></div>
+      </section>
+
+      <section class="panel wide log-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">LIVE LOG TAIL</p><h2>详细日志</h2></div>
+          <div class="log-actions"><select id="log-select" aria-label="选择日志"></select><label>尾部行数 <input id="log-lines" type="number" min="20" max="2000" value="500" /></label></div>
+        </div>
+        <pre id="log-output" tabindex="0">选择一个日志文件查看内容。</pre>
+      </section>
+
+      <footer>仅监听 127.0.0.1。页面可能包含健康数据与调试信息，请勿转发或公开部署。</footer>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

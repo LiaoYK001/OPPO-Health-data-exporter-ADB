@@ -24,6 +24,9 @@ ohealth-exporter = "health_exporter.cli:main"
 [tool.setuptools.packages.find]
 include = ["health_exporter*"]
 
+[tool.setuptools.package-data]
+health_exporter = ["web/*.html", "web/*.css", "web/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

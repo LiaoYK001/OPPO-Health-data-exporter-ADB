@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import re
 import tempfile
 import time
@@ -220,6 +221,85 @@ class ViewportEvidence:
     chart_artifacts: tuple[tuple[str, Artifact, tuple[int, int, int, int]], ...]
 
 
+@dataclass(frozen=True)
+class CalendarMonthView:
+    year: int
+    month: int
+    label_bounds: tuple[int, int, int, int]
+    grid_bounds: tuple[int, int, int, int]
+
+
+def calendar_month_views(tree: UiTree) -> list[CalendarMonthView]:
+    """Return visible calendar months with years reconstructed across December."""
+
+    year_node = tree.by_id("calendar_year_value")
+    if year_node is None:
+        return []
+    year_match = re.search(r"(\d{4})年", node_label(year_node))
+    if year_match is None:
+        return []
+    year = int(year_match.group(1))
+    month_nodes = sorted(
+        (node for node in tree.nodes if local_id(node) == "month_value"),
+        key=lambda node: (parse_bounds(node.attrib.get("bounds", "")) or (0, 0, 0, 0))[1],
+    )
+    result: list[CalendarMonthView] = []
+    previous_month: int | None = None
+    for node in month_nodes:
+        month_match = re.fullmatch(r"(\d{1,2})月", node_label(node))
+        label_bounds = parse_bounds(node.attrib.get("bounds", ""))
+        parent = tree.parent.get(node)
+        if month_match is None or label_bounds is None or parent is None:
+            continue
+        month = int(month_match.group(1))
+        if not 1 <= month <= 12:
+            continue
+        if previous_month is not None and month < previous_month:
+            year += 1
+        previous_month = month
+        grid_bounds = None
+        children = list(parent)
+        try:
+            node_index = children.index(node)
+        except ValueError:
+            continue
+        for child in children[node_index + 1 :]:
+            bounds = parse_bounds(child.attrib.get("bounds", ""))
+            if bounds is not None:
+                grid_bounds = bounds
+                break
+        if grid_bounds is None:
+            continue
+        result.append(CalendarMonthView(year, month, label_bounds, grid_bounds))
+    return result
+
+
+def calendar_day_point(
+    month_view: CalendarMonthView,
+    day: int,
+    screen_width: int,
+) -> tuple[int, int] | None:
+    """Map an OPPO custom-drawn calendar cell to its screen coordinate."""
+
+    try:
+        days_in_month = (dt.date(month_view.year + (month_view.month == 12), month_view.month % 12 + 1, 1) - dt.timedelta(days=1)).day
+        first_weekday = (dt.date(month_view.year, month_view.month, 1).weekday() + 1) % 7
+    except ValueError:
+        return None
+    if not 1 <= day <= days_in_month or screen_width <= 0:
+        return None
+    cell_index = first_weekday + day - 1
+    row, column = divmod(cell_index, 7)
+    week_rows = math.ceil((first_weekday + days_in_month) / 7)
+    x = round(screen_width * (column + 1) / 8)
+    grid_top = month_view.grid_bounds[1]
+    grid_height = month_view.grid_bounds[3] - grid_top
+    if grid_height <= 0:
+        return None
+    y = round(grid_top + grid_height * (row + 0.5) / week_rows)
+    return x, y
+
+
 class UiCollector:
     def __init__(
         self,
@@ -432,11 +512,15 @@ class UiCollector:
             and current_date > checkpoint_date
             and (current_date - checkpoint_date).days >= 3
         ):
-            current_date = self._resume_to_checkpoint(
-                profile,
-                current_date,
-                checkpoint_date,
-            )
+            calendar_date = self._resume_via_calendar(profile, checkpoint_date)
+            if calendar_date is not None:
+                current_date = calendar_date
+            else:
+                current_date = self._resume_to_checkpoint(
+                    profile,
+                    current_date,
+                    checkpoint_date,
+                )
         captured = skipped = failures = attempted = 0
         visited = 0
         while current_date >= earliest_date:
@@ -815,6 +899,179 @@ class UiCollector:
                     )
                 current = parsed
         return current
+
+    def _resume_via_calendar(
+        self,
+        profile: MetricUiProfile,
+        checkpoint: dt.date,
+        *,
+        max_rounds: int = 24,
+    ) -> dt.date | None:
+        """Jump to a checkpoint through OPPO's month calendar when available.
+
+        The date cells are custom-drawn and absent from UIAutomator. Month and
+        year labels remain semantic nodes, so the collector navigates by those
+        labels, aligns the whole target month on screen, then calculates the
+        date cell from the Gregorian weekday layout. Every tap is accepted only
+        after the detail page reports the exact requested date.
+        """
+
+        def month_index(year: int, month: int) -> int:
+            return year * 12 + month - 1
+
+        def screen_bounds(tree: UiTree) -> tuple[int, int]:
+            bounds = [
+                value
+                for node in tree.nodes
+                if (value := parse_bounds(node.attrib.get("bounds", "")))
+            ]
+            return (
+                max((value[2] for value in bounds), default=0),
+                max((value[3] for value in bounds), default=0),
+            )
+
+        calendar_open = False
+        with tempfile.TemporaryDirectory(prefix="ohealth-calendar-resume-") as temp:
+            temp_root = Path(temp)
+            try:
+                initial_view = self._scroll_to_top(max_swipes=8)
+                if initial_view is not None:
+                    page_tree = initial_view[0]
+                else:
+                    page_tree, _ = self.dump_tree(temp_root, "page")
+                opener = page_tree.by_id("iv_down") or page_tree.date_node(profile)
+                if opener is None:
+                    print(
+                        f"[calendar] {profile.metric}: no date-picker opener; "
+                        "falling back to previous-day batches",
+                        flush=True,
+                    )
+                    return None
+                clickable = page_tree.clickable_ancestor(opener) or opener
+                opener_bounds = parse_bounds(clickable.attrib.get("bounds", ""))
+                if opener_bounds is None:
+                    return None
+                self.adb.tap(*center(opener_bounds))
+                deadline = time.time() + 8
+                calendar_tree: UiTree | None = None
+                while time.time() < deadline:
+                    time.sleep(0.4)
+                    candidate, _ = self.dump_tree(temp_root, "calendar-open")
+                    if candidate.by_id("recycler_view") is not None and calendar_month_views(candidate):
+                        calendar_tree = candidate
+                        calendar_open = True
+                        break
+                if calendar_tree is None:
+                    return None
+
+                target_index = month_index(checkpoint.year, checkpoint.month)
+                for round_index in range(max_rounds):
+                    months = calendar_month_views(calendar_tree)
+                    if not months:
+                        return None
+                    width, height = screen_bounds(calendar_tree)
+                    recycler = calendar_tree.by_id("recycler_view")
+                    recycler_bounds = (
+                        parse_bounds(recycler.attrib.get("bounds", ""))
+                        if recycler is not None
+                        else None
+                    )
+                    if width <= 0 or height <= 0 or recycler_bounds is None:
+                        return None
+                    matching = next(
+                        (
+                            item
+                            for item in months
+                            if (item.year, item.month) == (checkpoint.year, checkpoint.month)
+                        ),
+                        None,
+                    )
+                    x1, y1, x2, y2 = recycler_bounds
+                    gesture_x = (x1 + x2) // 2
+                    gesture_top = y1 + round((y2 - y1) * 0.15)
+                    gesture_bottom = y1 + round((y2 - y1) * 0.85)
+                    if matching is not None:
+                        # UIAutomator clips a partially visible custom month
+                        # view to the screen. Move it upward before calculating
+                        # a date coordinate; clipped bottom-row taps are unsafe.
+                        if matching.grid_bounds[1] < y1:
+                            align_start, align_end = gesture_top, gesture_bottom
+                        elif matching.grid_bounds[3] >= height - 24:
+                            align_start, align_end = gesture_bottom, gesture_top
+                        else:
+                            align_start = align_end = 0
+                        if align_start != align_end:
+                            self.adb.swipe(
+                                gesture_x,
+                                align_start,
+                                gesture_x,
+                                align_end,
+                                500,
+                            )
+                            time.sleep(0.7)
+                            calendar_tree, _ = self.dump_tree(
+                                temp_root, f"calendar-align-{round_index:02d}"
+                            )
+                            continue
+                        point = calendar_day_point(matching, checkpoint.day, width)
+                        if point is None:
+                            return None
+                        self.adb.tap(*point)
+                        deadline = time.time() + 10
+                        while time.time() < deadline:
+                            time.sleep(0.5)
+                            result_tree, _ = self.dump_tree(temp_root, "calendar-result")
+                            label = result_tree.date_label(profile)
+                            parsed = date_from_label(label or "", checkpoint)
+                            if parsed == checkpoint:
+                                print(
+                                    f"[calendar] {profile.metric}: jumped directly to "
+                                    f"{checkpoint.isoformat()}",
+                                    flush=True,
+                                )
+                                return parsed
+                        return None
+
+                    first_index = month_index(months[0].year, months[0].month)
+                    last_index = month_index(months[-1].year, months[-1].month)
+                    if target_index < first_index:
+                        distance = first_index - target_index
+                        start_y, end_y = gesture_top, gesture_bottom
+                    elif target_index > last_index:
+                        distance = target_index - last_index
+                        start_y, end_y = gesture_bottom, gesture_top
+                    else:
+                        return None
+                    for _ in range(min(max(1, distance), 8)):
+                        self.adb.swipe(
+                            gesture_x,
+                            start_y,
+                            gesture_x,
+                            end_y,
+                            500,
+                        )
+                        time.sleep(0.12)
+                    time.sleep(0.6)
+                    calendar_tree, _ = self.dump_tree(
+                        temp_root, f"calendar-nav-{round_index:02d}"
+                    )
+            except Exception as exc:
+                print(
+                    f"[calendar] {profile.metric}: {exc}; "
+                    "falling back to previous-day batches",
+                    flush=True,
+                )
+            finally:
+                if calendar_open:
+                    with tempfile.TemporaryDirectory(prefix="ohealth-calendar-close-") as close_temp:
+                        try:
+                            final_tree, _ = self.dump_tree(Path(close_temp), "state")
+                            if final_tree.by_id("recycler_view") is not None:
+                                self.adb.keyevent("BACK")
+                                time.sleep(0.4)
+                        except Exception:
+                            pass
+        return None
 
     @staticmethod
     def _previous_tap_point(

@@ -45,6 +45,8 @@ python .\ohealth_exporter.py collect --ui-only --all-history --resume
 - 中断时尚未完整提交的日期可能重新采集一次，以保证页面证据完整；
 - 当天数据属于 `partial`，再次同步时会生成一个新版本，旧版本和旧素材不会被删除或覆盖。
 
+续跑时不再从最新日期逐日翻到 checkpoint。采集器会打开详情页日期右侧的下拉箭头，进入日历，以月为单位滚动到 checkpoint 前一天；目标月份完全进入屏幕后，根据真实日历星期布局点击日期，并以详情页显示的完整日期做严格确认。只有日历控件不可识别或确认失败时，才退回原来的逐日快速翻页方式。因此无需人工预先跳转日期。
+
 #### 电脑计划重启：先安全暂停
 
 电脑需要正常重启、关机或安装系统更新时，不要直接在任务管理器中结束 Python，也不要先关闭 MuMu。先在项目目录执行：
@@ -92,6 +94,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 #### 突然断电或来不及暂停
 
 如果电脑已经死机、断电或强制重启，无法提前执行暂停脚本，开机后仍按“开机后恢复采集”的步骤操作。恢复脚本会把没有对应存活进程的旧 `running` 批次改为 `interrupted`，再从最后一次成功提交的 checkpoint 继续。最坏情况下只会重新采集最后一个未完整提交的日期；已完成历史日期、原始证据和旧版本不会被覆盖。
+
+### 本地可视化监控与调试日志
+
+监控页只读取本机 SQLite、素材、运行进程和 `data\logs\`，不会启动、停止或操作采集器，也不会把健康数据发送到外网。在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+```
+
+浏览器会打开 `http://127.0.0.1:8765/`。页面每 5 秒更新一次，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、批次记录、未解决失败、素材数量和容量、日历跳转证据，以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
+
+也可直接运行：
+
+```powershell
+python .\ohealth_exporter.py dashboard --open
+```
+
+监控服务默认只监听 `127.0.0.1`。因为页面包含个人健康采集状态和日志，不要改成公网监听地址，也不要通过公网隧道转发。
 
 ### 校验和表格
 

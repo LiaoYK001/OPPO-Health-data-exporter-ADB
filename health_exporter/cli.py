@@ -26,6 +26,7 @@ from .constants import (
     UI_PROFILES,
 )
 from .db import Database
+from .dashboard import serve_dashboard
 from .errors import ExporterError, RootRequiredError, VersionMismatchError
 from .exporting import DailyExporter
 from .frida_bridge import capture_database_key
@@ -829,6 +830,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = commands.add_parser("verify", help="校验素材哈希和指标日期覆盖")
     verify_parser.add_argument("--source-id", type=int)
     verify_parser.add_argument("--fast", action="store_true", help="跳过全量 SHA-256 复算")
+    dashboard_parser = commands.add_parser(
+        "dashboard", help="启动本地只读采集状态与日志面板"
+    )
+    dashboard_parser.add_argument("--host", default="127.0.0.1")
+    dashboard_parser.add_argument("--port", type=int, default=8765)
+    dashboard_parser.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
     return parser
 
 
@@ -846,6 +853,7 @@ def main() -> int:
         "export": export_data,
         "repair-normalized": repair_normalized,
         "verify": verify_data,
+        "dashboard": serve_dashboard,
     }
     try:
         return handlers[args.command](args)

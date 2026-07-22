@@ -108,6 +108,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 
 恢复脚本会先运行 UI 阶段环境检查，检查通过后才删除停止标志，并从 checkpoint 续跑心率及后续指标。若电脑突然断电、来不及执行暂停脚本，也直接按开机后的步骤恢复；遗留的 `running` 批次会被标为 `interrupted`，至多重抓最后一个未完整提交的日期。
 
+恢复后无需人工逐日翻回中断日期，也无需先手工定位指标。采集器进入对应指标详情后，会点击日期右侧下拉箭头打开日历，按月份滚动到 checkpoint 前一天，等待目标月份完整显示后计算日期格位置并点击；随后读取详情页的完整日期做严格确认。只有日历打开、定位或日期确认失败时，才自动退回逐日快速翻页。日志中以 `[calendar]` 开头的记录会说明日历定位过程和最终确认结果。
+
 每个“指标 × 日期”会保存：
 
 - 所有滚动视口的 PNG 和 UI XML；
@@ -120,13 +122,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 
 使用 `--max-days N` 分批时，`N` 表示本批新采集或尝试的日期数；为了到达 checkpoint 而翻过的已完成日期不会消耗该额度。当日重抓也不会把已经推进到更早日期的历史 checkpoint 覆盖回今天。
 
-## 7. 精确数据边界
+## 7. 本地可视化监控与日历证据
+
+如需随时查看进度、故障和详细日志，在项目目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+```
+
+打开 `http://127.0.0.1:8765/`。监控页是只读工具，不会删除 `STOP_UI_COLLECTION`，不会恢复采集器，也不会向 MuMu 发送点击。页面包括：
+
+- ADB、Root、OPPO 健康前台页面及采集/监督进程；
+- 各指标 checkpoint、日期范围、页面与素材数量；
+- 最近运行批次、未解决失败和可切换的日志尾部；
+- “打开日历—定位目标月份—单击目标日—详情页日期确认”的逐步截图、XML 哈希和验收结果。
+
+页面默认每 5 秒刷新。日志阅读器兼容 UTF-8、带 BOM 的 UTF-16 和中文 Windows 常见的 GB18030；如果看到乱码，先刷新页面并确认服务使用的是当前代码。监控服务仅监听本机 `127.0.0.1`，不要对公网开放。
+
+## 8. 精确数据边界
 
 截图仅用于验真，不能根据柱高或折线位置反推数值并冒充精确值。图表的步数时间片、心率/血氧采样、睡眠阶段等必须来自解密后的原始数据库或 APP 数据服务。当前主库已确认加密，在密钥提取完成前，相应精细序列必须标记为阻断缺口，不能把 `visual_only` 当成语义完整。
 
 Root 风险提示不会阻止已经完成的快照，但数据库密钥提取需要另一次短暂 Root 窗口。该操作只读取运行时返回值和建立临时导出，不修改 OPPO 健康源数据；完成后仍应立即关闭 Root。
 
-## 8. 导出和验收
+## 9. 导出和验收
 
 ```powershell
 python .\ohealth_exporter.py repair-normalized
@@ -148,6 +167,6 @@ req1 最终验收要求：
 - 所有素材 SHA-256 可复算；
 - CSV/XLSX 可仅从 SQLite 重复生成。
 
-## 9. 隐私与容量
+## 10. 隐私与容量
 
 `data/` 含健康数据、账号/设备原始字段、截图和数据库，已加入 `.gitignore`。不要将其上传到公开仓库。多年逐页证据可能占用 10–50GB；全量开始前预留空间，完成后制作两份加密备份。

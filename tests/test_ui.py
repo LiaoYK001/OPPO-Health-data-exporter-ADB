@@ -7,9 +7,12 @@ from pathlib import Path
 
 from health_exporter.constants import UI_PROFILES
 from health_exporter.ui import (
+    CalendarMonthView,
     UiCollector,
     UiTree,
     advance_checkpoint_date,
+    calendar_day_point,
+    calendar_month_views,
     canvas_previous_point,
 )
 
@@ -293,6 +296,46 @@ def test_resume_navigation_batches_clicks_and_verifies_actual_date(tmp_path: Pat
 
     assert reached == dt.date(2026, 7, 1)
     assert fake_adb.taps == 9
+
+
+def test_calendar_month_views_reconstructs_year_across_december() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node text="2024年" resource-id="calendar_year_value"
+                bounds="[600,260][840,366]"/>
+          <node resource-id="recycler_view" scrollable="true"
+                bounds="[0,480][1440,2560]">
+            <node bounds="[0,480][1440,2172]">
+              <node text="12月" resource-id="month_value"
+                    bounds="[96,480][300,620]"/>
+              <node class="android.view.View" bounds="[76,620][1364,2132]"/>
+            </node>
+            <node bounds="[0,2172][1440,2560]">
+              <node text="1月" resource-id="month_value"
+                    bounds="[96,2172][246,2312]"/>
+              <node class="android.view.View" bounds="[76,2312][1364,2560]"/>
+            </node>
+          </node>
+        </hierarchy>
+        """
+    )
+
+    months = calendar_month_views(UiTree(root))
+
+    assert [(item.year, item.month) for item in months] == [(2024, 12), (2025, 1)]
+
+
+def test_calendar_day_point_maps_custom_canvas_cell() -> None:
+    april = CalendarMonthView(
+        year=2024,
+        month=4,
+        label_bounds=(96, 480, 246, 620),
+        grid_bounds=(76, 620, 1364, 2132),
+    )
+
+    assert calendar_day_point(april, 9, 1440) == (540, 1074)
+    assert calendar_day_point(april, 31, 1440) is None
 
 
 def test_partial_today_does_not_replace_older_resume_boundary() -> None:
