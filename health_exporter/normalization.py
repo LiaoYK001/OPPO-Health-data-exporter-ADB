@@ -24,6 +24,7 @@ TABLE_METRICS = {
     "dbheartratedatastattable": "heart_rate",
     "dbsleep": "sleep",
     "dbsleeptable": "sleep",
+    "dbsleepdatastattable": "sleep",
     "dbsleepdaystat": "sleep",
     "dbsleepmainstat": "sleep",
     "dbsleepdayfrgstat": "sleep",
@@ -40,6 +41,7 @@ TABLE_METRICS = {
 DAILY_TABLES = {
     "dbsportdatastat",
     "dbheartratedatastattable",
+    "dbsleepdatastattable",
     "dbsleepdaystat",
     "dbsleepmainstat",
     "dbsleepdayfrgstat",
@@ -83,6 +85,17 @@ STAT_SUMMARY_MAPS: dict[str, dict[str, tuple[str, str | None]]] = {
         "awake_raw": ("total_wake_up_time", None),
         "wake_count": ("wake_count", "count"),
         "sleep_score": ("sleep_score", "score"),
+    },
+    "dbsleepdatastattable": {
+        "sleep_start_minute_offset": ("fall_asleep", "min"),
+        "sleep_end_minute_offset": ("sleep_out", "min"),
+        "total_sleep_raw": ("total_sleep_time", "min"),
+        "deep_sleep_raw": ("total_deep_sleep_time", "min"),
+        "light_sleep_raw": ("total_lightly_sleep_time", "min"),
+        "rem_sleep_raw": ("total_rem_time", "min"),
+        "awake_raw": ("total_wake_up_time", "min"),
+        "sleep_score": ("sleep_score", "score"),
+        "checked_sleep_score": ("checked_sleep_score", "score"),
     },
     "dbsleepmainstat": {
         "sleep_start_utc_ms": ("sleep_in_timestamp", "ms"),

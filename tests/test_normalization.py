@@ -176,6 +176,46 @@ def test_sleep_stage_is_preserved_as_interval(tmp_path: Path) -> None:
     db.close()
 
 
+def test_legacy_sleep_daily_stat_extends_source_history(tmp_path: Path) -> None:
+    db, source_id, run_id = make_runtime(tmp_path)
+    normalizer = OppoNormalizer(db, source_id, run_id)
+    normalizer.ingest_row(
+        "DBSleepDataStatTable",
+        {
+            "_id": 1,
+            "date": 20220101,
+            "fall_asleep": 1627,
+            "sleep_out": 628,
+            "total_sleep_time": 436,
+            "total_deep_sleep_time": 150,
+            "total_lightly_sleep_time": 197,
+            "total_rem_time": 89,
+            "total_wake_up_time": 5,
+            "sleep_score": 82,
+            "checked_sleep_score": 1,
+        },
+        ["_id"],
+        "fixture.db",
+    )
+
+    normalizer.finalize()
+
+    record = db.connection.execute(
+        "SELECT * FROM metric_records WHERE canonical_metric='sleep'"
+    ).fetchone()
+    assert record["local_date"] == "2022-01-01"
+    daily = db.connection.execute(
+        "SELECT * FROM daily_metrics_current WHERE canonical_metric='sleep'"
+    ).fetchone()
+    summary = json.loads(daily["summary_json"])
+    assert summary["total_sleep_raw"] == 436
+    assert summary["total_sleep_raw__unit"] == "min"
+    assert summary["sleep_start_minute_offset"] == 1627
+    assert summary["sleep_score"] == 82
+    assert summary["vendor_summaries"]["DBSleepDataStatTable"][0]["sleep_out"] == 628
+    db.close()
+
+
 def test_sleep_intervals_are_marked_primary_against_visible_session() -> None:
     summary = {
         "sleep_start_utc_ms": 1000,

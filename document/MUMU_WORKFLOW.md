@@ -106,7 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collectio
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1
 ```
 
-恢复脚本会先运行 UI 阶段环境检查，检查通过后才删除停止标志，并从 checkpoint 续跑心率及后续指标。若电脑突然断电、来不及执行暂停脚本，也直接按开机后的步骤恢复；遗留的 `running` 批次会被标为 `interrupted`，至多重抓最后一个未完整提交的日期。
+恢复脚本会先运行 UI 阶段环境检查，检查通过后才删除停止标志。它会比较心率 checkpoint 与心率最早来源日期：若二者相等则跳过已经完成的心率，直接续跑活动、睡眠、血氧、血压、体重和压力；否则先续跑心率。若电脑突然断电、来不及执行暂停脚本，也直接按开机后的步骤恢复；遗留的 `running` 批次会被标为 `interrupted`，至多重抓最后一个未完整提交的日期。
 
 恢复后无需人工逐日翻回中断日期，也无需先手工定位指标。采集器进入对应指标详情后，会点击日期右侧下拉箭头打开日历，按月份滚动到 checkpoint 前一天，等待目标月份完整显示后计算日期格位置并点击；随后读取详情页的完整日期做严格确认。只有日历打开、定位或日期确认失败时，才自动退回逐日快速翻页。日志中以 `[calendar]` 开头的记录会说明日历定位过程和最终确认结果。
 

@@ -301,6 +301,35 @@ def calendar_day_point(
     return x, y
 
 
+def classify_home_cards(cards: set[str]) -> dict[str, list[str]]:
+    """Classify health-home labels without treating known detail links as cards."""
+
+    primary_titles = {
+        title
+        for profile in UI_PROFILES.values()
+        for title in profile.home_titles
+    }
+    detail_titles = {
+        title
+        for profile in UI_PROFILES.values()
+        for title in profile.subpage_titles
+    }
+    included = sorted(
+        card for card in cards if card in primary_titles or card == "每日活动"
+    )
+    excluded = sorted(card for card in cards if card in EXCLUDED_HOME_CARDS)
+    known_details = sorted(card for card in cards if card in detail_titles)
+    unknown = sorted(
+        cards - set(included) - set(excluded) - set(known_details)
+    )
+    return {
+        "included": included,
+        "excluded": excluded,
+        "known_details": known_details,
+        "unknown": unknown,
+    }
+
+
 class UiCollector:
     def __init__(
         self,
@@ -398,19 +427,10 @@ class UiCollector:
                     break
                 time.sleep(0.6)
         self._scroll_to_top()
-        primary_titles = {
-            title
-            for profile in UI_PROFILES.values()
-            for title in profile.home_titles
-        }
-        included = sorted(card for card in cards if card in primary_titles or card == "每日活动")
-        excluded = sorted(card for card in cards if card in EXCLUDED_HOME_CARDS)
-        unknown = sorted(cards - set(included) - set(excluded))
+        classification = classify_home_cards(cards)
         return {
             "cards": sorted(cards),
-            "included": included,
-            "excluded": excluded,
-            "unknown": unknown,
+            **classification,
             "views": views,
         }
 

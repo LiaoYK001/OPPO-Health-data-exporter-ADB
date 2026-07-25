@@ -412,6 +412,27 @@ def _latest_snapshot(data_dir: Path) -> SnapshotResult:
     return SnapshotResult(str(manifest["run_id"]), files, path)
 
 
+def _latest_decrypted_snapshot(data_dir: Path) -> SnapshotResult:
+    candidates = sorted((data_dir / "manifests").glob("oppo-decrypted-*.json"))
+    if not candidates:
+        raise ExporterError(
+            "没有可复用的 OPPO 明文快照；请先完成 key-capture。"
+        )
+    path = candidates[-1]
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    database_path = data_dir / manifest["local_path"]
+    if not database_path.is_file():
+        raise ExporterError(f"明文快照文件不存在：{database_path}")
+    snapshot_file = SnapshotFile(
+        remote_path=str(manifest.get("source") or "frida://sqlcipher_export/database.db"),
+        local_path=database_path,
+        artifact_sha256=str(manifest["sha256"]),
+        sqlite_status="sqlite",
+        tables=tuple(str(item) for item in manifest.get("tables", [])),
+    )
+    return SnapshotResult(str(manifest["run_id"]), (snapshot_file,), path)
+
+
 def _parse_metrics(value: str) -> list[str]:
     if value == "all":
         return list(PRIMARY_METRICS)
@@ -613,6 +634,48 @@ def collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def reextract_source(args: argparse.Namespace) -> int:
+    """Re-run normalization from the latest immutable decrypted snapshot."""
+
+    with Runtime(args, require_adb=False) as runtime:
+        source = runtime.db.latest_source("oppo")
+        if source is None:
+            raise ExporterError("没有可用于重新提取的 OPPO 数据源。")
+        source_id = int(source["id"])
+        app_version = str(source["app_version"] or "unknown")
+        run_id = runtime.db.start_run(
+            source_id,
+            "reextract-source",
+            app_version,
+            "local-snapshot",
+            {"snapshot": "latest", "ui": False},
+        )
+        try:
+            snapshot = _latest_decrypted_snapshot(runtime.data_dir)
+            adapter = OppoAdapter(
+                None,  # type: ignore[arg-type]
+                runtime.db,
+                runtime.artifacts,
+                runtime.data_dir,
+                app_version,
+            )
+            result = adapter.extract(snapshot, source_id, run_id)
+            runtime.db.finish_run(run_id, "complete")
+            json_print(
+                {
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "snapshot_manifest": str(snapshot.manifest_path.resolve()),
+                    "source_extract": result,
+                }
+            )
+            return 0
+        except Exception as exc:
+            runtime.db.record_failure(run_id, "reextract_source", exc)
+            runtime.db.finish_run(run_id, "failed", str(exc))
+            raise
+
+
 def capture_current(args: argparse.Namespace) -> int:
     with Runtime(args, require_adb=True) as runtime:
         adb, source_id = runtime.require_device()
@@ -808,6 +871,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect_parser = commands.add_parser("collect", help="采集并规范化全部历史")
     _add_collect_arguments(collect_parser)
+    commands.add_parser(
+        "reextract-source",
+        help="从最新不可变明文快照重新提取新增或修正的源表映射",
+    )
     run_parser = commands.add_parser("run", help="采集、校验并导出 CSV/XLSX")
     _add_collect_arguments(run_parser)
 
@@ -847,6 +914,7 @@ def main() -> int:
         "snapshot-source": snapshot_source,
         "key-capture": key_capture,
         "collect": collect,
+        "reextract-source": reextract_source,
         "run": run_all,
         "capture": capture_current,
         "probe-heart": probe_heart,

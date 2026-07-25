@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [int]$HeartProcessId,
+    [int]$HeartProcessId = 0,
+
+    [switch]$HeartAlreadyComplete,
 
     [string]$Workspace = (Split-Path -Parent $PSScriptRoot),
 
@@ -45,27 +46,33 @@ $Python = (Get-Command python -ErrorAction Stop).Source
 $CurrentHeartProcessId = $HeartProcessId
 $HeartRestartCount = 0
 
-while ($true) {
-    $HeartProcess = Get-Process -Id $CurrentHeartProcessId -ErrorAction Stop
-    Write-SupervisorLog "waiting for heart-rate collector pid=$CurrentHeartProcessId restart=$HeartRestartCount/$MaxHeartRestarts"
-    $HeartProcess.WaitForExit()
-    $HeartRunStatus = Get-LatestCollectStatus
-    Write-SupervisorLog "heart-rate collector pid=$CurrentHeartProcessId exited run_status=$HeartRunStatus"
+if ($HeartAlreadyComplete) {
+    Write-SupervisorLog 'heart-rate checkpoint already equals the earliest source date; skipping heart-rate restart'
+} else {
+    if ($CurrentHeartProcessId -le 0) {
+        throw 'HeartProcessId is required unless HeartAlreadyComplete is set'
+    }
+    while ($true) {
+        $HeartProcess = Get-Process -Id $CurrentHeartProcessId -ErrorAction Stop
+        Write-SupervisorLog "waiting for heart-rate collector pid=$CurrentHeartProcessId restart=$HeartRestartCount/$MaxHeartRestarts"
+        $HeartProcess.WaitForExit()
+        $HeartRunStatus = Get-LatestCollectStatus
+        Write-SupervisorLog "heart-rate collector pid=$CurrentHeartProcessId exited run_status=$HeartRunStatus"
 
-    if ($HeartRunStatus -eq 'complete') {
-        break
-    }
-    if (Test-Path -LiteralPath $StopFile) {
-        Write-SupervisorLog "stop marker present; collector will not restart: $StopFile"
-        exit 1
-    }
-    if ($HeartRestartCount -ge $MaxHeartRestarts) {
-        Write-SupervisorLog 'remaining metrics not started because heart-rate retry limit was reached'
-        exit 1
-    }
+        if ($HeartRunStatus -eq 'complete') {
+            break
+        }
+        if (Test-Path -LiteralPath $StopFile) {
+            Write-SupervisorLog "stop marker present; collector will not restart: $StopFile"
+            exit 1
+        }
+        if ($HeartRestartCount -ge $MaxHeartRestarts) {
+            Write-SupervisorLog 'remaining metrics not started because heart-rate retry limit was reached'
+            exit 1
+        }
 
-    $InterruptedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $MarkInterrupted = @"
+        $InterruptedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $MarkInterrupted = @"
 import sqlite3
 
 connection = sqlite3.connect("data/health.sqlite3")
@@ -77,33 +84,34 @@ connection.execute(
 )
 connection.commit()
 "@
-    $MarkInterrupted | & $Python -
-    if ($LASTEXITCODE -ne 0) {
-        Write-SupervisorLog 'failed to mark abandoned collector run; automatic restart cancelled'
-        exit $LASTEXITCODE
-    }
+        $MarkInterrupted | & $Python -
+        if ($LASTEXITCODE -ne 0) {
+            Write-SupervisorLog 'failed to mark abandoned collector run; automatic restart cancelled'
+            exit $LASTEXITCODE
+        }
 
-    $HeartRestartCount += 1
-    $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $HeartStdout = Join-Path $LogDir "heart-history-retry-$Stamp.out.log"
-    $HeartStderr = Join-Path $LogDir "heart-history-retry-$Stamp.err.log"
-    $HeartArguments = @(
-        '.\ohealth_exporter.py',
-        'collect',
-        '--ui-only',
-        '--metrics',
-        'heart_rate',
-        '--all-history',
-        '--resume',
-        '--max-scrolls',
-        '20'
-    )
-    Write-SupervisorLog "restarting heart-rate collector attempt=$HeartRestartCount; stdout=$HeartStdout stderr=$HeartStderr"
-    $HeartProcess = Start-Process -FilePath $Python -ArgumentList $HeartArguments `
-        -WorkingDirectory $Workspace -WindowStyle Hidden `
-        -RedirectStandardOutput $HeartStdout -RedirectStandardError $HeartStderr `
-        -PassThru
-    $CurrentHeartProcessId = $HeartProcess.Id
+        $HeartRestartCount += 1
+        $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $HeartStdout = Join-Path $LogDir "heart-history-retry-$Stamp.out.log"
+        $HeartStderr = Join-Path $LogDir "heart-history-retry-$Stamp.err.log"
+        $HeartArguments = @(
+            '.\ohealth_exporter.py',
+            'collect',
+            '--ui-only',
+            '--metrics',
+            'heart_rate',
+            '--all-history',
+            '--resume',
+            '--max-scrolls',
+            '20'
+        )
+        Write-SupervisorLog "restarting heart-rate collector attempt=$HeartRestartCount; stdout=$HeartStdout stderr=$HeartStderr"
+        $HeartProcess = Start-Process -FilePath $Python -ArgumentList $HeartArguments `
+            -WorkingDirectory $Workspace -WindowStyle Hidden `
+            -RedirectStandardOutput $HeartStdout -RedirectStandardError $HeartStderr `
+            -PassThru
+        $CurrentHeartProcessId = $HeartProcess.Id
+    }
 }
 
 $CheckpointProbe = @'

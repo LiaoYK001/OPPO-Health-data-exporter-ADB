@@ -14,6 +14,7 @@ from health_exporter.ui import (
     calendar_day_point,
     calendar_month_views,
     canvas_previous_point,
+    classify_home_cards,
 )
 
 
@@ -336,6 +337,16 @@ def test_calendar_day_point_maps_custom_canvas_cell() -> None:
 
     assert calendar_day_point(april, 9, 1440) == (540, 1074)
     assert calendar_day_point(april, 31, 1440) is None
+
+
+def test_known_heart_detail_links_are_not_unknown_home_cards() -> None:
+    result = classify_home_cards(
+        {"心率", "静息心率", "步行平均心率", "睡眠基准心率", "意外的新指标"}
+    )
+
+    assert result["included"] == ["心率"]
+    assert result["known_details"] == ["步行平均心率", "睡眠基准心率", "静息心率"]
+    assert result["unknown"] == ["意外的新指标"]
 
 
 def test_partial_today_does_not_replace_older_resume_boundary() -> None:

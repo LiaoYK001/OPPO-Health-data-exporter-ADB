@@ -85,7 +85,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collectio
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
 ```
 
-恢复脚本会先检查 ADB 连接、显示配置、APP 版本、前台 APP、剩余磁盘空间及 Root 是否关闭。检查全部通过后，它才会删除 `STOP_UI_COLLECTION`，修复重启前遗留的运行状态，并从 SQLite checkpoint 恢复心率采集；心率完成后，监督脚本会自动衔接活动、睡眠、血氧、血压、体重和压力。
+恢复脚本会先检查 ADB 连接、显示配置、APP 版本、前台 APP、剩余磁盘空间及 Root 是否关闭。检查全部通过后，它才会删除 `STOP_UI_COLLECTION` 并修复重启前遗留的运行状态。若心率 checkpoint 已等于心率最早来源日期，脚本会跳过重复心率采集，直接衔接活动、睡眠、血氧、血压、体重和压力；否则先从心率 checkpoint 继续。
 
 看到“页面采集已从 SQLite checkpoint 继续”以及心率采集和后续指标调度的 PID 后，即表示恢复成功。之后保持 MuMu 和电脑运行，不要操作模拟器，也不要开启 Root。运行日志保存在 `data\logs\`。
 
@@ -118,10 +118,13 @@ python .\ohealth_exporter.py dashboard --open
 ### 校验和表格
 
 ```powershell
+python .\ohealth_exporter.py reextract-source
 python .\ohealth_exporter.py repair-normalized
 python .\ohealth_exporter.py verify
 python .\ohealth_exporter.py export --format both
 ```
+
+`reextract-source` 会从最近一次不可变的明文 OPPO 数据库快照重新执行表映射和规范化，不连接 ADB，也不修改模拟器中的 APP 数据。新增或修正旧版 vendor 表映射后可运行此命令；已有原始版本不会重复写入。
 
 CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇总；日内采样点、睡眠阶段区间、原始 vendor 字段和页面证据保留在 SQLite/素材库中。
 
