@@ -264,15 +264,116 @@ def calendar_month_views(tree: UiTree) -> list[CalendarMonthView]:
             node_index = children.index(node)
         except ValueError:
             continue
+        grid_candidates: list[tuple[int, tuple[int, int, int, int]]] = []
         for child in children[node_index + 1 :]:
             bounds = parse_bounds(child.attrib.get("bounds", ""))
             if bounds is not None:
-                grid_bounds = bounds
-                break
+                area = max(0, bounds[2] - bounds[0]) * max(
+                    0, bounds[3] - bounds[1]
+                )
+                grid_candidates.append((area, bounds))
+        if grid_candidates:
+            # OPPO places a small "congratulation" label before the custom
+            # sleep calendar View.  Selecting the first sibling therefore
+            # points into the label instead of the date grid.  The actual
+            # custom grid is the largest bounded sibling following the month.
+            grid_bounds = max(grid_candidates, key=lambda item: item[0])[1]
         if grid_bounds is None:
             continue
         result.append(CalendarMonthView(year, month, label_bounds, grid_bounds))
     return result
+
+
+def calendar_semantic_day_point(
+    tree: UiTree,
+    month_view: CalendarMonthView,
+    day: int,
+) -> tuple[int, int] | None:
+    """Return an exact activity-calendar date node when OPPO exposes one.
+
+    Daily Activity uses semantic TextViews for its date cells, while Sleep
+    draws the month into one custom View.  Nodes belonging to a month follow
+    its ``month_value`` node in document order until the next month header.
+    """
+
+    nodes = tree.nodes
+    month_index: int | None = None
+    for index, node in enumerate(nodes):
+        if (
+            local_id(node) == "month_value"
+            and parse_bounds(node.attrib.get("bounds", "")) == month_view.label_bounds
+        ):
+            month_index = index
+            break
+    if month_index is None:
+        return None
+    for node in nodes[month_index + 1 :]:
+        if local_id(node) == "month_value":
+            break
+        if local_id(node) != "health_tv_calendar_date":
+            continue
+        if node_label(node) != str(day):
+            continue
+        bounds = parse_bounds(node.attrib.get("bounds", ""))
+        if bounds is not None:
+            return center(bounds)
+    return None
+
+
+def calendar_semantic_target_point(
+    tree: UiTree,
+    month_views: list[CalendarMonthView],
+    target: dt.date,
+) -> tuple[int, int] | None:
+    """Find an exact Activity date even when its month heading is clipped.
+
+    RecyclerView can leave the final rows of June visible while only July's
+    month heading remains on screen.  In document order, semantic date nodes
+    before the first visible month heading belong to its preceding month.
+    """
+
+    if not month_views:
+        return None
+    view_by_bounds = {view.label_bounds: view for view in month_views}
+    headers: list[tuple[int, CalendarMonthView]] = []
+    for index, node in enumerate(tree.nodes):
+        if local_id(node) != "month_value":
+            continue
+        bounds = parse_bounds(node.attrib.get("bounds", ""))
+        view = view_by_bounds.get(bounds) if bounds is not None else None
+        if view is not None:
+            headers.append((index, view))
+    if not headers:
+        return None
+
+    first_index, first_view = headers[0]
+    if first_view.month == 1:
+        prefix_year, prefix_month = first_view.year - 1, 12
+    else:
+        prefix_year, prefix_month = first_view.year, first_view.month - 1
+    segments: list[tuple[int, int, int, int]] = [
+        (0, first_index, prefix_year, prefix_month)
+    ]
+    for header_offset, (start, view) in enumerate(headers):
+        end = (
+            headers[header_offset + 1][0]
+            if header_offset + 1 < len(headers)
+            else len(tree.nodes)
+        )
+        segments.append((start + 1, end, view.year, view.month))
+
+    for start, end, year, month in segments:
+        if (year, month) != (target.year, target.month):
+            continue
+        for node in tree.nodes[start:end]:
+            if (
+                local_id(node) == "health_tv_calendar_date"
+                and node_label(node) == str(target.day)
+            ):
+                bounds = parse_bounds(node.attrib.get("bounds", ""))
+                if bounds is not None:
+                    return center(bounds)
+    return None
 
 
 def calendar_day_point(
@@ -1319,7 +1420,7 @@ class UiCollector:
         profile: MetricUiProfile,
         checkpoint: dt.date,
         *,
-        max_rounds: int = 24,
+        max_rounds: int = 120,
     ) -> dt.date | None:
         """Jump to a checkpoint through OPPO's month calendar when available.
 
@@ -1441,10 +1542,35 @@ class UiCollector:
                     return None
 
                 target_index = month_index(checkpoint.year, checkpoint.month)
+                last_scroll: tuple[int, int, int] | None = None
+                empty_month_rounds = 0
                 for round_index in range(max_rounds):
                     months = calendar_month_views(calendar_tree)
                     if not months:
-                        return None
+                        if last_scroll is None or empty_month_rounds >= 4:
+                            return None
+                        # A long Activity month can fill the viewport while its
+                        # month heading is clipped just outside the screen.
+                        # Continue gently in the known direction until the next
+                        # semantic month heading becomes visible.
+                        empty_month_rounds += 1
+                        gesture_x, start_y, end_y = last_scroll
+                        midpoint = (start_y + end_y) // 2
+                        short_start = (start_y + midpoint) // 2
+                        short_end = (end_y + midpoint) // 2
+                        self.adb.swipe(
+                            gesture_x,
+                            short_start,
+                            gesture_x,
+                            short_end,
+                            450,
+                        )
+                        time.sleep(0.8)
+                        calendar_tree, _ = self.dump_tree(
+                            temp_root, f"calendar-gap-{round_index:03d}"
+                        )
+                        continue
+                    empty_month_rounds = 0
                     width, height = screen_bounds(calendar_tree)
                     recycler = calendar_tree.by_id("recycler_view")
                     recycler_bounds = (
@@ -1462,17 +1588,37 @@ class UiCollector:
                         ),
                         None,
                     )
+                    semantic_target = calendar_semantic_target_point(
+                        calendar_tree,
+                        months,
+                        checkpoint,
+                    )
                     x1, y1, x2, y2 = recycler_bounds
                     gesture_x = (x1 + x2) // 2
                     gesture_top = y1 + round((y2 - y1) * 0.15)
                     gesture_bottom = y1 + round((y2 - y1) * 0.85)
-                    if matching is not None:
+                    if matching is not None or semantic_target is not None:
+                        semantic_point = semantic_target
+                        if semantic_point is None and matching is not None:
+                            semantic_point = calendar_semantic_day_point(
+                                calendar_tree,
+                                matching,
+                                checkpoint.day,
+                            )
                         # UIAutomator clips a partially visible custom month
                         # view to the screen. Move it upward before calculating
                         # a date coordinate; clipped bottom-row taps are unsafe.
-                        if matching.grid_bounds[1] < y1:
+                        if semantic_point is not None:
+                            # Daily Activity exposes exact date TextViews. Use
+                            # those coordinates instead of estimating a canvas
+                            # cell from unrelated summary-card bounds.
+                            align_start = align_end = 0
+                        elif matching is not None and matching.grid_bounds[1] < y1:
                             align_start, align_end = gesture_top, gesture_bottom
-                        elif matching.grid_bounds[3] >= height - 24:
+                        elif (
+                            matching is not None
+                            and matching.grid_bounds[3] >= height - 24
+                        ):
                             align_start, align_end = gesture_bottom, gesture_top
                         else:
                             align_start = align_end = 0
@@ -1486,7 +1632,12 @@ class UiCollector:
                                 page="calendar",
                                 action="swipe_calendar",
                                 status="started",
-                                details={"round": round_index, "grid_bounds": matching.grid_bounds},
+                                details={
+                                    "round": round_index,
+                                    "grid_bounds": (
+                                        matching.grid_bounds if matching is not None else None
+                                    ),
+                                },
                             )
                             self.adb.swipe(
                                 gesture_x,
@@ -1500,7 +1651,13 @@ class UiCollector:
                                 temp_root, f"calendar-align-{round_index:02d}"
                             )
                             continue
-                        point = calendar_day_point(matching, checkpoint.day, width)
+                        point = semantic_point
+                        if point is None and matching is not None:
+                            point = calendar_day_point(
+                                matching,
+                                checkpoint.day,
+                                width,
+                            )
                         if point is None:
                             return None
                         self._event(
@@ -1512,7 +1669,13 @@ class UiCollector:
                             page="calendar",
                             action="tap_calendar_day",
                             status="started",
-                            details={"point": point, "grid_bounds": matching.grid_bounds},
+                            details={
+                                "point": point,
+                                "grid_bounds": (
+                                    matching.grid_bounds if matching is not None else None
+                                ),
+                                "semantic": semantic_point is not None,
+                            },
                         )
                         self.adb.tap(*point)
                         deadline = time.time() + 10
@@ -1556,7 +1719,15 @@ class UiCollector:
                         start_y, end_y = gesture_bottom, gesture_top
                     else:
                         return None
-                    for _ in range(min(max(1, distance), 8)):
+                    # Use short, settled batches while far away, then verify
+                    # every gesture near the target. Rapid 120 ms batches can
+                    # reverse or overshoot RecyclerView while it is animating.
+                    if distance <= 3:
+                        midpoint = (start_y + end_y) // 2
+                        start_y = (start_y + midpoint) // 2
+                        end_y = (end_y + midpoint) // 2
+                    swipe_count = 4 if distance > 6 else 2 if distance > 3 else 1
+                    for _ in range(swipe_count):
                         self.adb.swipe(
                             gesture_x,
                             start_y,
@@ -1564,11 +1735,12 @@ class UiCollector:
                             end_y,
                             500,
                         )
-                        time.sleep(0.12)
+                        time.sleep(0.65)
+                    last_scroll = (gesture_x, start_y, end_y)
                     self._event(
                         "INFO",
                         "calendar.scroll_months",
-                        f"向目标月份滚动 {min(max(1, distance), 8)} 次",
+                        f"向目标月份稳定滚动 {swipe_count} 次后校验",
                         metric=profile.metric,
                         local_date=checkpoint.isoformat(),
                         page="calendar",
@@ -1576,14 +1748,15 @@ class UiCollector:
                         status="complete",
                         details={
                             "round": round_index,
+                            "swipe_count": swipe_count,
                             "distance_months": distance,
                             "visible_first": f"{months[0].year:04d}-{months[0].month:02d}",
                             "visible_last": f"{months[-1].year:04d}-{months[-1].month:02d}",
                         },
                     )
-                    time.sleep(0.6)
+                    time.sleep(0.5)
                     calendar_tree, _ = self.dump_tree(
-                        temp_root, f"calendar-nav-{round_index:02d}"
+                        temp_root, f"calendar-nav-{round_index:03d}"
                     )
             except Exception as exc:
                 self._event(

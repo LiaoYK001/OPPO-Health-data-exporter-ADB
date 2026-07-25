@@ -13,6 +13,8 @@ from health_exporter.ui import (
     advance_checkpoint_date,
     calendar_day_point,
     calendar_month_views,
+    calendar_semantic_day_point,
+    calendar_semantic_target_point,
     canvas_previous_point,
     classify_home_cards,
 )
@@ -337,6 +339,109 @@ def test_calendar_day_point_maps_custom_canvas_cell() -> None:
 
     assert calendar_day_point(april, 9, 1440) == (540, 1074)
     assert calendar_day_point(april, 31, 1440) is None
+
+
+def test_calendar_month_view_uses_largest_grid_after_summary_label() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node text="2026年" resource-id="calendar_year_value"
+                bounds="[602,261][838,366]"/>
+          <node resource-id="recycler_view" scrollable="true"
+                bounds="[0,480][1440,2560]">
+            <node bounds="[0,779][1440,2560]">
+              <node text="7月" resource-id="month_value"
+                    bounds="[96,779][246,919]"/>
+              <node text="" resource-id="congratulation"
+                    bounds="[76,919][96,1008]"/>
+              <node class="android.view.View"
+                    bounds="[76,1008][1364,2520]"/>
+            </node>
+          </node>
+        </hierarchy>
+        """
+    )
+
+    months = calendar_month_views(UiTree(root))
+
+    assert len(months) == 1
+    assert months[0].grid_bounds == (76, 1008, 1364, 2520)
+
+
+def test_activity_calendar_uses_exact_semantic_date_node() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node text="2025年" resource-id="calendar_year_value"
+                bounds="[602,168][838,273]"/>
+          <node resource-id="recycler_view" scrollable="true"
+                bounds="[0,455][1440,2560]">
+            <node bounds="[0,455][1440,2560]">
+              <node bounds="[76,535][1364,1009]">
+                <node text="8月" resource-id="month_value"
+                      bounds="[96,535][222,652]"/>
+                <node text="已达标0/31天" resource-id="congratulation"
+                      bounds="[238,566][578,648]"/>
+              </node>
+              <node bounds="[76,2321][1364,2560]">
+                <node bounds="[444,2321][628,2560]">
+                  <node text="26" resource-id="health_tv_calendar_date"
+                        bounds="[492,2321][580,2409]"/>
+                </node>
+                <node bounds="[628,2321][812,2560]">
+                  <node text="27" resource-id="health_tv_calendar_date"
+                        bounds="[676,2321][764,2409]"/>
+                </node>
+              </node>
+            </node>
+          </node>
+        </hierarchy>
+        """
+    )
+    tree = UiTree(root)
+    month = calendar_month_views(tree)[0]
+
+    assert calendar_semantic_day_point(tree, month, 27) == (720, 2365)
+    assert calendar_semantic_day_point(tree, month, 31) is None
+
+
+def test_activity_calendar_maps_clipped_previous_month_dates() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node text="2024年" resource-id="calendar_year_value"
+                bounds="[602,168][838,273]"/>
+          <node resource-id="recycler_view" scrollable="true"
+                bounds="[0,455][1440,2560]">
+            <node bounds="[0,455][1440,2560]">
+              <node bounds="[260,819][444,1123]">
+                <node text="24" resource-id="health_tv_calendar_date"
+                      bounds="[308,863][396,951]"/>
+              </node>
+              <node bounds="[76,1735][1364,2209]">
+                <node text="7月" resource-id="month_value"
+                      bounds="[96,1735][222,1852]"/>
+                <node text="已达标0/31天" resource-id="congratulation"
+                      bounds="[238,1766][578,1848]"/>
+              </node>
+              <node bounds="[260,2261][444,2560]">
+                <node text="1" resource-id="health_tv_calendar_date"
+                      bounds="[308,2305][396,2393]"/>
+              </node>
+            </node>
+          </node>
+        </hierarchy>
+        """
+    )
+    tree = UiTree(root)
+    months = calendar_month_views(tree)
+
+    assert [(item.year, item.month) for item in months] == [(2024, 7)]
+    assert calendar_semantic_target_point(
+        tree,
+        months,
+        dt.date(2024, 6, 24),
+    ) == (352, 907)
 
 
 def test_known_heart_detail_links_are_not_unknown_home_cards() -> None:
