@@ -59,7 +59,14 @@ class OperationLogger:
                     handle.flush()
         except OSError as exc:
             if self.echo:
-                print(f"{payload['timestamp']} [WARNING] operation_log 写入失败：{exc}", flush=True)
+                try:
+                    print(
+                        f"{payload['timestamp']} [WARNING] operation_log 写入失败：{exc}",
+                        flush=True,
+                    )
+                except OSError:
+                    # A detached/closed terminal must never abort collection.
+                    pass
             return payload
         if self.echo:
             context = " ".join(
@@ -68,11 +75,15 @@ class OperationLogger:
                 if item
             )
             context_text = f" [{context}]" if context else ""
-            print(
-                f"{payload['timestamp']} [{payload['level']}]{context_text} "
-                f"{event}: {message}",
-                flush=True,
-            )
+            try:
+                print(
+                    f"{payload['timestamp']} [{payload['level']}]{context_text} "
+                    f"{event}: {message}",
+                    flush=True,
+                )
+            except OSError:
+                # Structured JSONL is durable; console echo is optional.
+                pass
         return payload
 
 

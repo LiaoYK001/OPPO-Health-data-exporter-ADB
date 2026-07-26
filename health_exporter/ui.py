@@ -68,6 +68,13 @@ def canvas_previous_point(
 
 
 def date_from_label(label: str, reference: dt.date) -> dt.date | None:
+    relative = re.sub(r"[\s，,。]", "", label)
+    if relative.startswith(("今天", "今日")):
+        return reference
+    if relative.startswith(("昨天", "昨日")):
+        return reference - dt.timedelta(days=1)
+    if relative.startswith("前天"):
+        return reference - dt.timedelta(days=2)
     match = DATE_PATTERN.search(label)
     if not match:
         return None
@@ -691,6 +698,7 @@ class UiCollector:
         metric: str,
         *,
         earliest_date: dt.date,
+        target_dates: tuple[dt.date, ...] | None = None,
         max_days: int | None = None,
         resume: bool = True,
         capture_subpages: bool = True,
@@ -710,6 +718,7 @@ class UiCollector:
                 "max_days": max_days,
                 "resume": resume,
                 "capture_subpages": capture_subpages,
+                "target_dates": len(target_dates) if target_dates is not None else None,
             },
         )
         tree = self.enter_metric(metric)
@@ -760,6 +769,18 @@ class UiCollector:
             status="ready",
             details={"ui_label": label, "checkpoint": checkpoint_date},
         )
+        if target_dates is not None:
+            return self._capture_sparse_dates(
+                metric,
+                profile,
+                current_date=current_date,
+                earliest_date=earliest_date,
+                target_dates=target_dates,
+                checkpoint_date=checkpoint_date,
+                max_days=max_days,
+                capture_subpages=capture_subpages,
+                max_scrolls=max_scrolls,
+            )
         if (
             checkpoint_date is not None
             and current_date > checkpoint_date
@@ -920,6 +941,35 @@ class UiCollector:
                 break
             previous_date = self._go_previous_day(profile, current_date)
             if previous_date is None:
+                expected_previous = current_date - dt.timedelta(days=1)
+                self._event(
+                    "WARNING",
+                    "navigation.previous_day_stalled",
+                    "点击上一天后日期没有变化，改用日历直达预期日期",
+                    metric=metric,
+                    local_date=expected_previous.isoformat(),
+                    page=metric,
+                    action="calendar_recovery",
+                    status="retrying",
+                    details={"current_date": current_date.isoformat()},
+                )
+                recovered = self._resume_via_calendar(
+                    profile,
+                    expected_previous,
+                )
+                if recovered == expected_previous:
+                    previous_date = recovered
+                    self._event(
+                        "INFO",
+                        "navigation.calendar_recovered",
+                        f"日历恢复成功，已切换到 {recovered.isoformat()}",
+                        metric=metric,
+                        local_date=recovered.isoformat(),
+                        page=metric,
+                        action="calendar_recovery",
+                        status="complete",
+                    )
+            if previous_date is None:
                 self.db.record_failure(
                     self.run_id,
                     "date_navigation",
@@ -973,6 +1023,256 @@ class UiCollector:
             "failures": failures,
             "attempted": attempted,
             "visited": visited,
+        }
+
+    def _capture_sparse_dates(
+        self,
+        metric: str,
+        profile: MetricUiProfile,
+        *,
+        current_date: dt.date,
+        earliest_date: dt.date,
+        target_dates: tuple[dt.date, ...],
+        checkpoint_date: dt.date | None,
+        max_days: int | None,
+        capture_subpages: bool,
+        max_scrolls: int,
+    ) -> dict[str, Any]:
+        """Capture only exact source-backed days through calendar navigation."""
+
+        today = dt.date.today()
+        targets = sorted(
+            {
+                day
+                for day in target_dates
+                if earliest_date <= day <= today
+            },
+            reverse=True,
+        )
+        pending: list[dt.date] = []
+        skipped = 0
+        for target in targets:
+            already_done = (
+                checkpoint_date is not None
+                and target >= checkpoint_date
+                and target != today
+            )
+            if already_done:
+                skipped += 1
+            else:
+                pending.append(target)
+        span_days = (
+            (today - targets[-1]).days + 1
+            if targets
+            else 0
+        )
+        self._event(
+            "INFO",
+            "history.sparse_plan",
+            f"{metric} 来源数据稀疏：仅通过日历采集 {len(pending)} 个待处理有数据日期",
+            metric=metric,
+            page=metric,
+            action="plan_calendar_targets",
+            status="ready",
+            details={
+                "source_dates": len(targets),
+                "pending_dates": len(pending),
+                "skipped_dates": skipped,
+                "span_days": span_days,
+                "density": (len(targets) / span_days) if span_days else 0.0,
+                "first_target": targets[-1].isoformat() if targets else None,
+                "last_target": targets[0].isoformat() if targets else None,
+            },
+        )
+        captured = failures = attempted = visited = 0
+        for target in pending:
+            if max_days is not None and attempted >= max_days:
+                break
+            attempted += 1
+            visited += 1
+            day = target.isoformat()
+            self._event(
+                "INFO",
+                "day.begin",
+                f"通过日历处理有来源数据日期 {day}",
+                metric=metric,
+                local_date=day,
+                page=metric,
+                action="calendar_target_day",
+                status="started",
+                details={"visited": visited, "attempted": attempted},
+            )
+            if current_date != target:
+                reached = self._resume_via_calendar(profile, target)
+                if reached != target:
+                    message = f"日历无法直达有数据日期：{day}"
+                    self.db.record_failure(
+                        self.run_id,
+                        "date_navigation",
+                        message,
+                        metric=metric,
+                        local_date=day,
+                    )
+                    self.db.set_coverage(
+                        self.source_id,
+                        metric,
+                        day,
+                        "failed",
+                        {
+                            "database": True,
+                            "ui": False,
+                            "error": message,
+                            "basis": "source_date_calendar_navigation_failed",
+                        },
+                        self.run_id,
+                    )
+                    self.db.connection.commit()
+                    failures += 1
+                    self._event(
+                        "ERROR",
+                        "calendar.target_failed",
+                        message,
+                        metric=metric,
+                        local_date=day,
+                        page=metric,
+                        action="calendar_target_day",
+                        status="failed",
+                    )
+                    continue
+                current_date = reached
+            try:
+                self._event(
+                    "INFO",
+                    "page.capture_start",
+                    "开始采集有来源数据日期的全部滚动区域",
+                    metric=metric,
+                    local_date=day,
+                    page=metric,
+                    action="capture_page",
+                    status="started",
+                )
+                main_capture_id = self.capture_page(
+                    metric,
+                    day,
+                    metric,
+                    max_scrolls=max_scrolls,
+                )
+                if capture_subpages:
+                    self._capture_subpages(
+                        metric,
+                        day,
+                        profile,
+                        main_capture_id=main_capture_id,
+                        max_scrolls=max_scrolls,
+                    )
+                has_source_day = self._has_source_day(metric, day)
+                if not has_source_day:
+                    raise ExporterError(
+                        f"稀疏采集目标不再具有来源数据：{metric} {day}"
+                    )
+                self.db.set_coverage(
+                    self.source_id,
+                    metric,
+                    day,
+                    "exact_ui",
+                    {
+                        "database": True,
+                        "ui": True,
+                        "no_data": False,
+                        "basis": "source_target_and_ui_evidence",
+                    },
+                    self.run_id,
+                )
+                next_checkpoint, moved = advance_checkpoint_date(
+                    checkpoint_date,
+                    target,
+                    today,
+                )
+                if moved:
+                    self.db.set_checkpoint(
+                        self.source_id,
+                        metric,
+                        next_checkpoint.isoformat(),
+                        {
+                            "page_date": day,
+                            "status": "captured",
+                            "mode": "calendar_source_dates",
+                        },
+                    )
+                    checkpoint_date = next_checkpoint
+                self.db.connection.commit()
+                captured += 1
+                self._event(
+                    "INFO",
+                    "day.complete",
+                    f"有数据日期 {day} 已完整提交，capture_id={main_capture_id}",
+                    metric=metric,
+                    local_date=day,
+                    page=metric,
+                    action="commit_day",
+                    status="complete",
+                    details={
+                        "capture_id": main_capture_id,
+                        "has_source_day": True,
+                        "checkpoint": checkpoint_date,
+                        "mode": "calendar_source_dates",
+                    },
+                )
+            except Exception as exc:
+                failures += 1
+                self.db.record_failure(
+                    self.run_id,
+                    "ui_capture",
+                    exc,
+                    metric=metric,
+                    local_date=day,
+                )
+                self.db.set_coverage(
+                    self.source_id,
+                    metric,
+                    day,
+                    "failed",
+                    {"database": True, "ui": False, "error": str(exc)},
+                    self.run_id,
+                )
+                self.db.connection.commit()
+                self._event(
+                    "ERROR",
+                    "day.failed",
+                    str(exc),
+                    metric=metric,
+                    local_date=day,
+                    page=metric,
+                    action="capture_day",
+                    status="failed",
+                    details={"exception_type": type(exc).__name__},
+                )
+        self._event(
+            "INFO" if failures == 0 else "WARNING",
+            "history.complete",
+            f"{metric} 稀疏日历采集结束：采集 {captured}，跳过 {skipped}，失败 {failures}",
+            metric=metric,
+            page=metric,
+            action="capture_sparse_history",
+            status="complete" if failures == 0 else "completed_with_warnings",
+            details={
+                "captured": captured,
+                "skipped": skipped,
+                "failures": failures,
+                "attempted": attempted,
+                "visited": visited,
+                "target_dates": len(targets),
+            },
+        )
+        return {
+            "metric": metric,
+            "captured": captured,
+            "skipped": skipped,
+            "failures": failures,
+            "attempted": attempted,
+            "visited": visited,
+            "mode": "calendar_source_dates",
+            "target_dates": len(targets),
         }
 
     def capture_page(

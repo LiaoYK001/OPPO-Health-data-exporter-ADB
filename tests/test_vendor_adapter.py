@@ -32,6 +32,7 @@ def test_oppo_capture_and_verify_delegate_shared_engines() -> None:
         FakeCollector(),
         "heart_rate",
         earliest_date=dt.date(2022, 1, 1),
+        target_dates=(dt.date(2022, 1, 1),),
         max_days=7,
         resume=True,
         capture_subpages=True,
@@ -40,6 +41,7 @@ def test_oppo_capture_and_verify_delegate_shared_engines() -> None:
     assert captured == {
         "metric": "heart_rate",
         "earliest_date": dt.date(2022, 1, 1),
+        "target_dates": (dt.date(2022, 1, 1),),
         "max_days": 7,
         "resume": True,
         "capture_subpages": True,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
 
@@ -29,6 +30,24 @@ def test_operation_logger_writes_structured_timestamped_event(tmp_path: Path) ->
     assert event["run_id"] == "run-123"
     assert event["metric"] == "heart_rate"
     assert event["details"] == {"round": 3}
+
+
+def test_operation_logger_ignores_closed_console_pipe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operation-events.jsonl"
+    logger = OperationLogger(path, "run-detached", echo=True)
+
+    def closed_pipe(*_args, **_kwargs) -> None:
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(builtins, "print", closed_pipe)
+    event = logger.log("INFO", "day.begin", "继续采集")
+
+    assert event["event"] == "day.begin"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["run_id"] == "run-detached"
 
 
 def test_read_event_tail_returns_newest_complete_events(tmp_path: Path) -> None:

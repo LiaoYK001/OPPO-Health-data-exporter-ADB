@@ -1164,6 +1164,21 @@ class Database:
             return None
         return str(row["first_date"]), str(row["last_date"])
 
+    def metric_source_dates(self, source_id: int, metric: str) -> list[str]:
+        """Return exact canonical dates that have source-backed daily data."""
+
+        return [
+            str(row["local_date"])
+            for row in self.connection.execute(
+                """
+                SELECT local_date FROM daily_metrics_current
+                WHERE source_id=? AND canonical_metric=?
+                ORDER BY local_date DESC
+                """,
+                (source_id, metric),
+            )
+        ]
+
     def latest_source(self, vendor: str = "oppo") -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM sources WHERE vendor=? ORDER BY updated_at DESC LIMIT 1",

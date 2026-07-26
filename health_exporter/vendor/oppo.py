@@ -253,6 +253,7 @@ class OppoAdapter(VendorAdapter):
         metric: str,
         *,
         earliest_date: dt.date,
+        target_dates: tuple[dt.date, ...] | None,
         max_days: int | None,
         resume: bool,
         capture_subpages: bool,
@@ -261,6 +262,7 @@ class OppoAdapter(VendorAdapter):
         return collector.capture_history(
             metric,
             earliest_date=earliest_date,
+            target_dates=target_dates,
             max_days=max_days,
             resume=resume,
             capture_subpages=capture_subpages,

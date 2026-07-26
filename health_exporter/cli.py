@@ -443,6 +443,46 @@ def _parse_metrics(value: str) -> list[str]:
     return result
 
 
+def _sparse_calendar_targets(
+    source_dates: list[str],
+    *,
+    through_date: dt.date | None = None,
+    density_threshold: float = 0.5,
+    minimum_span_days: int = 30,
+) -> tuple[tuple[dt.date, ...] | None, dict[str, Any]]:
+    """Choose calendar-only capture when most source-history days are empty."""
+
+    through = through_date or dt.date.today()
+    parsed = sorted(
+        {
+            dt.date.fromisoformat(value)
+            for value in source_dates
+            if dt.date.fromisoformat(value) <= through
+        },
+        reverse=True,
+    )
+    if not parsed:
+        return None, {
+            "mode": "source_empty",
+            "source_days": 0,
+            "span_days": 0,
+            "density": 0.0,
+        }
+    span_days = max(1, (through - parsed[-1]).days + 1)
+    density = len(parsed) / span_days
+    sparse = span_days >= minimum_span_days and density < density_threshold
+    return (
+        tuple(parsed) if sparse else None,
+        {
+            "mode": "calendar_source_dates" if sparse else "day_by_day",
+            "source_days": len(parsed),
+            "span_days": span_days,
+            "density": density,
+            "density_threshold": density_threshold,
+        },
+    )
+
+
 def _collection_issues(
     unknown_cards: list[str],
     ui_results: list[dict[str, Any]],
@@ -531,7 +571,7 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                     home_card_present = any(
                         title in home["included"] for title in profile.home_titles
                     )
-                    if date_range is None and not home_card_present:
+                    if date_range is None:
                         runtime.db.set_coverage(
                             source_id,
                             metric,
@@ -540,8 +580,8 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                             {
                                 "database": False,
                                 "ui": False,
-                                "home_card_present": False,
-                                "basis": "source_empty_and_home_catalog_absent",
+                                "home_card_present": home_card_present,
+                                "basis": "exact_source_empty_skip_ui",
                             },
                             run_id,
                         )
@@ -556,7 +596,7 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                                 "metric": metric,
                                 "captured": 0,
                                 "no_data": True,
-                                "reason": "source_empty_and_home_catalog_absent",
+                                "reason": "exact_source_empty_skip_ui",
                             }
                         )
                         continue
@@ -565,16 +605,26 @@ def execute_collect(args: argparse.Namespace) -> dict[str, Any]:
                         if date_range
                         else dt.date.today()
                     )
+                    source_dates = runtime.db.metric_source_dates(source_id, metric)
+                    target_dates, strategy = _sparse_calendar_targets(source_dates)
+                    if target_dates is not None:
+                        runtime.db.reconcile_no_data_coverage(
+                            source_id,
+                            run_id,
+                            [metric],
+                        )
                     try:
                         capture_result = adapter.capture(
                             collector,
                             metric,
                             earliest_date=earliest,
+                            target_dates=target_dates,
                             max_days=args.max_days,
                             resume=args.resume,
                             capture_subpages=not args.no_subpages,
                             max_scrolls=args.max_scrolls,
                         )
+                        capture_result["strategy"] = strategy
                         ui_results.append(capture_result)
                         if capture_result["failures"] == 0 and capture_result["captured"] > 0:
                             runtime.db.resolve_failures(

@@ -17,6 +17,7 @@ from health_exporter.ui import (
     calendar_semantic_target_point,
     canvas_previous_point,
     classify_home_cards,
+    date_from_label,
 )
 
 
@@ -461,6 +462,14 @@ def test_partial_today_does_not_replace_older_resume_boundary() -> None:
     assert advance_checkpoint_date(existing, today, today) == (existing, False)
 
 
+def test_relative_date_labels_use_reference_day() -> None:
+    reference = dt.date(2026, 7, 26)
+
+    assert date_from_label("今天", reference) == reference
+    assert date_from_label("昨日", reference) == dt.date(2026, 7, 25)
+    assert date_from_label("前天，周五", reference) == dt.date(2026, 7, 24)
+
+
 def test_checkpoint_only_moves_toward_older_dates() -> None:
     today = dt.date(2026, 7, 21)
     existing = dt.date(2026, 6, 1)
@@ -548,3 +557,132 @@ def test_max_days_counts_new_attempts_not_checkpoint_skips() -> None:
         "attempted": 2,
         "visited": 5,
     }
+
+
+def test_sparse_history_uses_calendar_only_for_pending_source_dates() -> None:
+    class FakeConnection:
+        def commit(self) -> None:
+            pass
+
+    class FakeDatabase:
+        connection = FakeConnection()
+
+        def __init__(self) -> None:
+            self.last_date = "2026-07-15"
+
+        def get_checkpoint(self, _source_id: int, _metric: str) -> dict[str, str]:
+            return {"last_date": self.last_date}
+
+        def set_coverage(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def set_checkpoint(
+            self,
+            _source_id: int,
+            _metric: str,
+            day: str,
+            _state: dict[str, str],
+        ) -> None:
+            self.last_date = day
+
+        def record_failure(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unexpected sparse capture failure")
+
+    class FakeTree:
+        def date_label(self, _profile: object) -> str:
+            return "2026年7月20日"
+
+    collector = UiCollector.__new__(UiCollector)
+    collector.db = FakeDatabase()  # type: ignore[assignment]
+    collector.source_id = 1
+    collector.run_id = "sparse-test"
+    captured: list[str] = []
+    jumps: list[dt.date] = []
+    collector.enter_metric = lambda _metric: FakeTree()  # type: ignore[method-assign]
+    collector._resume_via_calendar = (  # type: ignore[method-assign]
+        lambda _profile, target: jumps.append(target) or target
+    )
+    collector.capture_page = (  # type: ignore[method-assign]
+        lambda _metric, day, _page_key, max_scrolls=12: captured.append(day) or 7
+    )
+    collector._capture_subpages = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    collector._has_source_day = lambda *_args: True  # type: ignore[method-assign]
+
+    result = collector.capture_history(
+        "spo2",
+        earliest_date=dt.date(2026, 7, 1),
+        target_dates=(
+            dt.date(2026, 7, 20),
+            dt.date(2026, 7, 15),
+            dt.date(2026, 7, 1),
+        ),
+        resume=True,
+        capture_subpages=False,
+        max_scrolls=20,
+    )
+
+    assert jumps == [dt.date(2026, 7, 1)]
+    assert captured == ["2026-07-01"]
+    assert result == {
+        "metric": "spo2",
+        "captured": 1,
+        "skipped": 2,
+        "failures": 0,
+        "attempted": 1,
+        "visited": 1,
+        "mode": "calendar_source_dates",
+        "target_dates": 3,
+    }
+
+
+def test_stalled_previous_day_recovers_through_calendar() -> None:
+    class FakeConnection:
+        def commit(self) -> None:
+            pass
+
+    class FakeDatabase:
+        connection = FakeConnection()
+
+        def get_checkpoint(self, _source_id: int, _metric: str) -> None:
+            return None
+
+        def set_coverage(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def set_checkpoint(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def record_failure(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("calendar recovery should avoid a failure")
+
+    class FakeTree:
+        def date_label(self, _profile: object) -> str:
+            return "2026年7月2日"
+
+    collector = UiCollector.__new__(UiCollector)
+    collector.db = FakeDatabase()  # type: ignore[assignment]
+    collector.source_id = 1
+    collector.run_id = "recovery-test"
+    captured: list[str] = []
+    recovered: list[dt.date] = []
+    collector.enter_metric = lambda _metric: FakeTree()  # type: ignore[method-assign]
+    collector.capture_page = (  # type: ignore[method-assign]
+        lambda _metric, day, _page_key, max_scrolls=12: captured.append(day) or 9
+    )
+    collector._capture_subpages = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    collector._has_source_day = lambda *_args: True  # type: ignore[method-assign]
+    collector._go_previous_day = lambda *_args: None  # type: ignore[method-assign]
+    collector._resume_via_calendar = (  # type: ignore[method-assign]
+        lambda _profile, target: recovered.append(target) or target
+    )
+
+    result = collector.capture_history(
+        "activity",
+        earliest_date=dt.date(2026, 7, 1),
+        resume=False,
+        capture_subpages=False,
+    )
+
+    assert recovered == [dt.date(2026, 7, 1)]
+    assert captured == ["2026-07-02", "2026-07-01"]
+    assert result["failures"] == 0
