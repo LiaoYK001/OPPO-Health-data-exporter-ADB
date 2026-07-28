@@ -25,7 +25,12 @@ from .constants import DEFAULT_SERIAL, DEFAULT_TIMEZONE
 from .dashboard import DashboardState
 from .db import Database
 from .errors import ExporterError
-from .metric_catalog import FIDELITY_RANK, METRIC_CATALOG
+from .metric_catalog import (
+    FIDELITY_RANK,
+    METRIC_CATALOG,
+    storage_metric,
+    visible_metrics,
+)
 
 
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -292,7 +297,7 @@ class WebDataService:
             )
             for source in sources:
                 source_id = int(source["id"])
-                source["metrics"] = _rows(
+                stored_metrics = _rows(
                     connection.execute(
                         """
                         SELECT canonical_metric, COUNT(*) AS day_count,
@@ -307,6 +312,18 @@ class WebDataService:
                         (source_id,),
                     )
                 )
+                metrics_by_storage = {
+                    str(item["canonical_metric"]): item for item in stored_metrics
+                }
+                source["metrics"] = []
+                for metric_key, definition in visible_metrics().items():
+                    stored = metrics_by_storage.get(storage_metric(metric_key))
+                    if stored is None:
+                        continue
+                    item = dict(stored)
+                    item["canonical_metric"] = metric_key
+                    item["display_name"] = definition["name"]
+                    source["metrics"].append(item)
                 source["coverage"] = _rows(
                     connection.execute(
                         """
@@ -361,10 +378,11 @@ class WebDataService:
                 )
             }
         result = []
-        for key, definition in METRIC_CATALOG.items():
+        for key, definition in visible_metrics().items():
+            stored_key = storage_metric(key)
             item = dict(definition)
             item["availability"] = availability.get(
-                key,
+                stored_key,
                 {
                     "canonical_metric": key,
                     "day_count": 0,
@@ -373,7 +391,9 @@ class WebDataService:
                     "partial_days": 0,
                 },
             )
-            item["availability"]["covered_days"] = coverage.get(key, 0)
+            item["availability"] = dict(item["availability"])
+            item["availability"]["canonical_metric"] = key
+            item["availability"]["covered_days"] = coverage.get(stored_key, 0)
             result.append(item)
         return result
 
@@ -400,10 +420,14 @@ class WebDataService:
         unknown = [metric for metric in metric_list if metric not in METRIC_CATALOG]
         if unknown:
             raise HTTPException(404, f"未知指标：{', '.join(unknown)}")
+        public_by_storage: dict[str, list[str]] = defaultdict(list)
+        for metric in metric_list:
+            public_by_storage[storage_metric(metric)].append(metric)
+        storage_metrics = list(public_by_storage)
         profile_id = self._profile_id(connection)
         source_clause, source_parameters = self._source_clause(source)
-        placeholders = ",".join("?" for _ in metric_list)
-        rows = _rows(
+        placeholders = ",".join("?" for _ in storage_metrics)
+        stored_rows = _rows(
             connection.execute(
                 f"""
                 SELECT d.id, d.source_id, d.canonical_metric, d.local_date,
@@ -430,14 +454,33 @@ class WebDataService:
                           END DESC,
                           d.revision DESC, d.source_id
                 """,
-                [profile_id, *metric_list, date_from, date_to, *source_parameters],
+                [
+                    profile_id,
+                    *storage_metrics,
+                    date_from,
+                    date_to,
+                    *source_parameters,
+                ],
             )
         )
-        for row in rows:
-            row["summary"] = self._public_summary(_json(row.pop("summary_json"), {}))
-            row["chart"] = _json(row.pop("chart_json"), {"series": {}, "intervals": []})
-            row["partial"] = bool(row.pop("is_partial"))
-            row["fidelity_rank"] = FIDELITY_RANK.get(str(row["fidelity"]), 0)
+        rows: list[dict[str, Any]] = []
+        for stored_row in stored_rows:
+            stored_key = str(stored_row["canonical_metric"])
+            for public_key in public_by_storage.get(stored_key, []):
+                row = dict(stored_row)
+                row["storage_metric"] = stored_key
+                row["canonical_metric"] = public_key
+                row["summary"] = self._public_summary(
+                    _json(row.pop("summary_json"), {})
+                )
+                row["chart"] = _json(
+                    row.pop("chart_json"), {"series": {}, "intervals": []}
+                )
+                row["partial"] = bool(row.pop("is_partial"))
+                row["fidelity_rank"] = FIDELITY_RANK.get(
+                    str(row["fidelity"]), 0
+                )
+                rows.append(row)
         return rows
 
     @staticmethod
@@ -482,7 +525,7 @@ class WebDataService:
         with self.connection() as connection:
             rows = self._daily_candidates(
                 connection,
-                metrics=METRIC_CATALOG,
+                metrics=visible_metrics(),
                 date_from=start,
                 date_to=end,
                 source=source,
@@ -492,7 +535,7 @@ class WebDataService:
         for row in selected:
             grouped[str(row["canonical_metric"])].append(self._compact_day(row))
         metrics: dict[str, Any] = {}
-        for metric, definition in METRIC_CATALOG.items():
+        for metric, definition in visible_metrics().items():
             days = grouped.get(metric, [])
             metrics[metric] = {
                 "definition": definition,
@@ -532,6 +575,7 @@ class WebDataService:
     def calendar(self, month: str, metric: str, source: str) -> dict[str, Any]:
         if metric not in METRIC_CATALOG:
             raise HTTPException(404, f"未知指标：{metric}")
+        stored_metric = storage_metric(metric)
         if not MONTH_PATTERN.fullmatch(month):
             raise HTTPException(400, "month 必须是 YYYY-MM")
         try:
@@ -554,7 +598,7 @@ class WebDataService:
             )
             selected = self._selected(candidates)
             coverage_source_clause = ""
-            parameters: list[Any] = [metric, start, end]
+            parameters: list[Any] = [stored_metric, start, end]
             if source != "unified":
                 try:
                     coverage_source_clause = " AND c.source_id=?"
@@ -614,6 +658,10 @@ class WebDataService:
 
     def metric_day(self, metric: str, local_date: str, source: str) -> dict[str, Any]:
         day = _date(local_date, "date")
+        if metric not in METRIC_CATALOG:
+            raise HTTPException(404, f"未知指标：{metric}")
+        stored_metric = storage_metric(metric)
+        definition = METRIC_CATALOG[metric]
         with self.connection() as connection:
             candidates = self._daily_candidates(
                 connection,
@@ -626,7 +674,7 @@ class WebDataService:
             selected = selected_rows[0] if selected_rows else None
             if selected is None:
                 coverage_clause = ""
-                coverage_parameters: list[Any] = [metric, day]
+                coverage_parameters: list[Any] = [stored_metric, day]
                 if source != "unified":
                     try:
                         coverage_clause = " AND c.source_id=?"
@@ -677,11 +725,14 @@ class WebDataService:
                      WHERE r.source_id=? AND r.canonical_metric=? AND r.local_date=?
                      ORDER BY s.sample_kind, s.timestamp_utc_ms
                     """,
-                    (source_id, metric, day),
+                    (source_id, stored_metric, day),
                 )
             )
+            allowed_series = set(definition.get("series_kinds", []))
             series: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for sample in sample_rows:
+                if str(sample["sample_kind"]) not in allowed_series:
+                    continue
                 series[str(sample["sample_kind"])].append(
                     {
                         "timestamp_utc_ms": sample["timestamp_utc_ms"],
@@ -704,7 +755,7 @@ class WebDataService:
                      WHERE r.source_id=? AND r.canonical_metric=? AND r.local_date=?
                      ORDER BY i.start_utc_ms, i.end_utc_ms
                     """,
-                    (source_id, metric, day),
+                    (source_id, stored_metric, day),
                 )
             )
             intervals = [
@@ -731,6 +782,8 @@ class WebDataService:
                 chart_series = selected.get("chart", {}).get("series", {})
                 if isinstance(chart_series, dict):
                     for kind, points in chart_series.items():
+                        if str(kind) not in allowed_series:
+                            continue
                         normalized_points = []
                         for point in points if isinstance(points, list) else []:
                             item = dict(point)
@@ -745,9 +798,11 @@ class WebDataService:
                 chart_intervals = selected.get("chart", {}).get("intervals", [])
                 if isinstance(chart_intervals, list):
                     intervals = chart_intervals
-            evidence = self._evidence(connection, source_id, metric, day)
-        expected_series = bool(METRIC_CATALOG[metric].get("series_kinds"))
-        expected_intervals = bool(METRIC_CATALOG[metric].get("interval_kinds"))
+            evidence = self._evidence(
+                connection, source_id, stored_metric, day
+            )
+        expected_series = bool(definition.get("series_kinds"))
+        expected_intervals = bool(definition.get("interval_kinds"))
         issues: list[str] = []
         if expected_series and not any(series.values()):
             issues.append("该日只有汇总，原始日内采样序列缺失")
@@ -903,6 +958,35 @@ class WebDataService:
                     """
                 ).fetchone()
             )
+        expanded_coverage: list[dict[str, Any]] = []
+        for row in coverage:
+            for metric_key in visible_metrics():
+                if storage_metric(metric_key) != row["canonical_metric"]:
+                    continue
+                item = dict(row)
+                item["canonical_metric"] = metric_key
+                expanded_coverage.append(item)
+        expanded_sequences: list[dict[str, Any]] = []
+        for row in sequences:
+            for metric_key, definition in visible_metrics().items():
+                if (
+                    storage_metric(metric_key) == row["canonical_metric"]
+                    and row["sample_kind"] in definition.get("series_kinds", [])
+                ):
+                    item = dict(row)
+                    item["canonical_metric"] = metric_key
+                    expanded_sequences.append(item)
+        expanded_intervals: list[dict[str, Any]] = []
+        for row in intervals:
+            for metric_key, definition in visible_metrics().items():
+                if (
+                    storage_metric(metric_key) == row["canonical_metric"]
+                    and row["interval_kind"]
+                    in definition.get("interval_kinds", [])
+                ):
+                    item = dict(row)
+                    item["canonical_metric"] = metric_key
+                    expanded_intervals.append(item)
         report_summary = None
         report_dir = self.data_dir / "reports"
         if report_dir.is_dir():
@@ -920,10 +1004,10 @@ class WebDataService:
                 except (OSError, json.JSONDecodeError):
                     report_summary = {"name": reports[0].name, "passed": None}
         return {
-            "coverage": coverage,
+            "coverage": expanded_coverage,
             "failures": failures,
-            "sequences": sequences,
-            "intervals_by_kind": intervals,
+            "sequences": expanded_sequences,
+            "intervals_by_kind": expanded_intervals,
             "totals": totals,
             "latest_verification": report_summary,
         }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { primaryText, valueText } from "./App";
+import { render, screen } from "@testing-library/react";
+import { LongTermStats, primaryText, valueText } from "./App";
 import type { DayRecord, MetricDefinition } from "./types";
 
 const definition: MetricDefinition = {
@@ -39,5 +40,23 @@ describe("health value presentation", () => {
       value: "12,345",
       unit: "步",
     });
+  });
+
+  it("shows total, daily average, maximum and recorded days for activity submetrics", () => {
+    render(
+      <LongTermStats
+        definition={{ ...definition, key: "active_energy", primary_unit: "千卡" }}
+        days={[
+          { ...day, local_date: "2026-01-01", summary: { steps: 100 } },
+          { ...day, local_date: "2026-01-02", summary: { steps: 300 } },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("所选范围总计")).toBeInTheDocument();
+    expect(screen.getByText("400 千卡")).toBeInTheDocument();
+    expect(screen.getByText("200 千卡")).toBeInTheDocument();
+    expect(screen.getByText("300 千卡")).toBeInTheDocument();
+    expect(screen.getByText("2 天")).toBeInTheDocument();
   });
 });

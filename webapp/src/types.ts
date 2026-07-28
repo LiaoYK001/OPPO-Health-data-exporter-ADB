@@ -23,6 +23,9 @@ export interface MetricDefinition {
   primary_unit: string;
   series_kinds: string[];
   interval_kinds?: string[];
+  storage_metric?: string;
+  long_term_stats?: boolean;
+  hidden?: boolean;
   summary_fields: SummaryField[];
   availability?: {
     day_count: number;
@@ -149,6 +152,7 @@ export interface SourceInfo {
   enabled: number;
   metrics: Array<{
     canonical_metric: string;
+    display_name?: string;
     day_count: number;
     earliest_date: string;
     latest_date: string;

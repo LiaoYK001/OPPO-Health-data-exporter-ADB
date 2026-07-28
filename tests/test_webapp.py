@@ -71,16 +71,115 @@ def test_web_api_selects_source_priority_without_overwriting_candidates(
             params={"from": "2026-01-02", "to": "2026-01-02", "source": "unified"},
         )
         detail = client.get(
-            "/api/v1/metrics/activity/days/2026-01-02",
+            "/api/v1/metrics/steps/days/2026-01-02",
             params={"source": "unified"},
         )
 
     assert overview.status_code == 200
-    selected = overview.json()["metrics"]["activity"]["days"][0]
+    selected = overview.json()["metrics"]["steps"]["days"][0]
     assert selected["source_id"] == xiaomi_id
     assert selected["summary"]["steps"] == 7000
     assert len(detail.json()["candidates"]) == 2
     assert sum(item["selected"] for item in detail.json()["candidates"]) == 1
+
+
+def test_activity_is_exposed_as_four_independent_metrics(tmp_path: Path) -> None:
+    data_dir, database = _database(tmp_path)
+    source_id, run_id = _source(database, "oppo", "oppo-install", 10)
+    database.upsert_daily_metric(
+        source_id=source_id,
+        canonical_metric="activity",
+        local_date="2026-03-04",
+        summary={
+            "steps": 9123,
+            "steps_goal": 6000,
+            "active_energy_kcal": 456,
+            "energy_goal_kcal": 300,
+            "workout_minutes": 35,
+            "workout_goal_minutes": 30,
+            "active_count": 11,
+            "active_count_goal": 12,
+        },
+        chart={
+            "series": {
+                "steps": [
+                    {
+                        "start_utc_ms": 1772553600000,
+                        "value": 123,
+                        "unit": "count",
+                    }
+                ],
+                "active_energy_kcal": [
+                    {
+                        "start_utc_ms": 1772553600000,
+                        "value": 4,
+                        "unit": "kcal",
+                    }
+                ],
+            },
+            "intervals": [],
+        },
+        fidelity="exact_source",
+        is_partial=False,
+        run_id=run_id,
+    )
+    database.connection.commit()
+    database.close()
+
+    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+        metrics = client.get("/api/v1/metrics").json()
+        overview = client.get(
+            "/api/v1/overview",
+            params={"from": "2026-03-04", "to": "2026-03-04"},
+        ).json()
+        details = {
+            key: client.get(f"/api/v1/metrics/{key}/days/2026-03-04").json()
+            for key in (
+                "steps",
+                "active_energy",
+                "workout_duration",
+                "active_count",
+            )
+        }
+        legacy = client.get(
+            "/api/v1/metrics/activity/daily",
+            params={"from": "2026-03-04", "to": "2026-03-04"},
+        )
+
+    metric_keys = [item["key"] for item in metrics]
+    assert "activity" not in metric_keys
+    assert metric_keys[:4] == [
+        "steps",
+        "active_energy",
+        "workout_duration",
+        "active_count",
+    ]
+    assert overview["metrics"]["steps"]["days"][0]["summary"]["steps"] == 9123
+    assert (
+        overview["metrics"]["active_energy"]["days"][0]["summary"][
+            "active_energy_kcal"
+        ]
+        == 456
+    )
+    assert (
+        overview["metrics"]["workout_duration"]["days"][0]["summary"][
+            "workout_minutes"
+        ]
+        == 35
+    )
+    assert (
+        overview["metrics"]["active_count"]["days"][0]["summary"][
+            "active_count"
+        ]
+        == 11
+    )
+    assert set(details["steps"]["data"]["series"]) == {"steps"}
+    assert set(details["active_energy"]["data"]["series"]) == {
+        "active_energy_kcal"
+    }
+    assert details["workout_duration"]["data"]["series"] == {}
+    assert details["active_count"]["data"]["series"] == {}
+    assert legacy.status_code == 200
 
 
 def test_web_api_prefers_fidelity_when_priorities_match(tmp_path: Path) -> None:

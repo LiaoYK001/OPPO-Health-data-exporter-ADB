@@ -4,9 +4,81 @@ from typing import Any
 
 
 METRIC_CATALOG: dict[str, dict[str, Any]] = {
+    "steps": {
+        "key": "steps",
+        "name": "步数",
+        "short_name": "步数",
+        "category": "activity",
+        "color": "#21c97a",
+        "accent": "#0ea863",
+        "primary_field": "steps",
+        "primary_unit": "步",
+        "series_kinds": ["steps"],
+        "storage_metric": "activity",
+        "long_term_stats": True,
+        "summary_fields": [
+            {"key": "steps", "label": "步数", "unit": "步"},
+            {"key": "steps_goal", "label": "步数目标", "unit": "步"},
+            {"key": "distance_m", "label": "距离", "unit": "米"},
+            {"key": "elevation_gain_m", "label": "爬升", "unit": "米"},
+        ],
+    },
+    "active_energy": {
+        "key": "active_energy",
+        "name": "消耗",
+        "short_name": "消耗",
+        "category": "activity",
+        "color": "#ff8a34",
+        "accent": "#e66a13",
+        "primary_field": "active_energy_kcal",
+        "primary_unit": "千卡",
+        "series_kinds": ["active_energy_kcal"],
+        "storage_metric": "activity",
+        "long_term_stats": True,
+        "summary_fields": [
+            {"key": "active_energy_kcal", "label": "活动消耗", "unit": "千卡"},
+            {"key": "energy_goal_kcal", "label": "消耗目标", "unit": "千卡"},
+            {"key": "static_energy_kcal", "label": "静息消耗", "unit": "千卡"},
+        ],
+    },
+    "workout_duration": {
+        "key": "workout_duration",
+        "name": "锻炼时长",
+        "short_name": "锻炼时长",
+        "category": "activity",
+        "color": "#f5b51b",
+        "accent": "#d49300",
+        "primary_field": "workout_minutes",
+        "primary_unit": "分钟",
+        "series_kinds": [],
+        "storage_metric": "activity",
+        "long_term_stats": True,
+        "summary_fields": [
+            {"key": "workout_minutes", "label": "锻炼时长", "unit": "分钟"},
+            {"key": "workout_goal_minutes", "label": "锻炼目标", "unit": "分钟"},
+        ],
+    },
+    "active_count": {
+        "key": "active_count",
+        "name": "活动次数",
+        "short_name": "活动次数",
+        "category": "activity",
+        "color": "#1ca9f4",
+        "accent": "#078bd2",
+        "primary_field": "active_count",
+        "primary_unit": "次",
+        "series_kinds": [],
+        "storage_metric": "activity",
+        "long_term_stats": True,
+        "summary_fields": [
+            {"key": "active_count", "label": "活动次数", "unit": "次"},
+            {"key": "active_count_goal", "label": "活动次数目标", "unit": "次"},
+            {"key": "sedentary_count", "label": "久坐次数", "unit": "次"},
+        ],
+    },
     "activity": {
         "key": "activity",
-        "name": "每日活动",
+        "name": "每日活动（兼容入口）",
         "short_name": "活动",
         "category": "activity",
         "color": "#36d98b",
@@ -31,6 +103,7 @@ METRIC_CATALOG: dict[str, dict[str, Any]] = {
             {"key": "workout_goal_minutes", "label": "锻炼目标", "unit": "分钟"},
             {"key": "active_count_goal", "label": "活动次数目标", "unit": "次"},
         ],
+        "hidden": True,
     },
     "heart_rate": {
         "key": "heart_rate",
@@ -158,3 +231,16 @@ FIDELITY_RANK = {
 
 def metric_definition(metric: str) -> dict[str, Any]:
     return METRIC_CATALOG[metric]
+
+
+def storage_metric(metric: str) -> str:
+    definition = metric_definition(metric)
+    return str(definition.get("storage_metric", metric))
+
+
+def visible_metrics() -> dict[str, dict[str, Any]]:
+    return {
+        key: definition
+        for key, definition in METRIC_CATALOG.items()
+        if not definition.get("hidden")
+    }

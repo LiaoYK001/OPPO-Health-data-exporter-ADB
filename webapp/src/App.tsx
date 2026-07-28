@@ -15,6 +15,8 @@ import {
   CircleAlert,
   Database,
   Droplets,
+  Flame,
+  Footprints,
   Gauge,
   HeartPulse,
   LayoutDashboard,
@@ -26,6 +28,7 @@ import {
   Server,
   ShieldCheck,
   SlidersHorizontal,
+  Timer,
   X,
 } from "lucide-react";
 import {
@@ -52,6 +55,10 @@ import type {
 
 const metricIcons: Record<string, typeof Activity> = {
   activity: Activity,
+  steps: Footprints,
+  active_energy: Flame,
+  workout_duration: Timer,
+  active_count: Activity,
   heart_rate: HeartPulse,
   sleep: MoonStar,
   spo2: Droplets,
@@ -295,7 +302,7 @@ function TrendChart({
       xAxis: {
         type: "category",
         data: points.map((point) => point.date.slice(5)),
-        boundaryGap: definition.key === "activity",
+        boundaryGap: definition.category === "activity",
         axisLine: { lineStyle: { color: "#d9e1dc" } },
         axisTick: { show: false },
         axisLabel: { color: "#708078", hideOverlap: true },
@@ -323,15 +330,18 @@ function TrendChart({
       series: [
         {
           name: definition.name,
-          type: definition.key === "activity" ? "bar" : "line",
+          type: definition.category === "activity" ? "bar" : "line",
           data: points.map((point) => point.value),
           symbol: points.length < 40 ? "circle" : "none",
           symbolSize: 6,
-          smooth: definition.key !== "activity",
+          smooth: definition.category !== "activity",
           lineStyle: { width: 2.4 },
-          itemStyle: { borderRadius: definition.key === "activity" ? [4, 4, 0, 0] : 0 },
+          itemStyle: {
+            borderRadius:
+              definition.category === "activity" ? [4, 4, 0, 0] : 0,
+          },
           areaStyle:
-            definition.key === "activity"
+            definition.category === "activity"
               ? undefined
               : { color: `${definition.color}18`, opacity: 0.8 },
         },
@@ -382,6 +392,42 @@ function TrendChart({
   );
 }
 
+export function LongTermStats({
+  days,
+  definition,
+}: {
+  days: DayRecord[];
+  definition: MetricDefinition;
+}) {
+  const values = days
+    .map((day) => number(day.summary[definition.primary_field]))
+    .filter((value): value is number => value !== null);
+  if (!values.length) return null;
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const average = total / values.length;
+  const maximum = Math.max(...values);
+  return (
+    <section className="range-stat-grid" aria-label={`${definition.name}长期统计量`}>
+      <article>
+        <span>所选范围总计</span>
+        <strong>{valueText(total, definition.primary_unit)}</strong>
+      </article>
+      <article>
+        <span>日均</span>
+        <strong>{valueText(average, definition.primary_unit)}</strong>
+      </article>
+      <article>
+        <span>单日最高</span>
+        <strong>{valueText(maximum, definition.primary_unit)}</strong>
+      </article>
+      <article>
+        <span>有记录日</span>
+        <strong>{values.length.toLocaleString("zh-CN")} 天</strong>
+      </article>
+    </section>
+  );
+}
+
 function IntradayChart({
   kind,
   points,
@@ -418,11 +464,13 @@ function IntradayChart({
       series: [
         {
           name: kind,
-          type: kind === "steps" ? "bar" : "line",
+          type: ["steps", "active_energy_kcal"].includes(kind) ? "bar" : "line",
           showSymbol: points.length < 50,
-          smooth: kind !== "steps",
+          smooth: !["steps", "active_energy_kcal"].includes(kind),
           data: points.map((point) => [point.timestamp_utc_ms, number(point.value)]),
-          areaStyle: kind === "steps" ? undefined : { color: `${color}18` },
+          areaStyle: ["steps", "active_energy_kcal"].includes(kind)
+            ? undefined
+            : { color: `${color}18` },
         },
       ],
     });
@@ -556,7 +604,7 @@ function HomePage({
       })
     : null;
   const { data, error, loading } = useRemote<Overview>(path);
-  const activityMetric = data?.metrics.activity;
+  const stepsMetric = data?.metrics.steps;
 
   return (
     <div className="page">
@@ -650,16 +698,16 @@ function HomePage({
               <div className="panel-heading">
                 <div>
                   <p className="section-label">ACTIVITY RHYTHM</p>
-                  <h2>活动趋势</h2>
+                  <h2>步数趋势</h2>
                 </div>
-                <Link className="text-link" to="/metrics/activity">
-                  查看完整活动 <ChevronRight size={16} />
+                <Link className="text-link" to="/metrics/steps">
+                  查看完整步数 <ChevronRight size={16} />
                 </Link>
               </div>
-              {activityMetric ? (
+              {stepsMetric ? (
                 <TrendChart
-                  days={activityMetric.days}
-                  definition={activityMetric.definition}
+                  days={stepsMetric.days}
+                  definition={stepsMetric.definition}
                 />
               ) : (
                 <EmptyBlock />
@@ -975,7 +1023,19 @@ function MetricPage({
         {daily.loading && <LoadingBlock />}
         {daily.error && <ErrorBlock message={daily.error} />}
         {daily.data && (
-          <TrendChart days={daily.data.days} definition={definition} height={340} />
+          <>
+            {definition.long_term_stats && (
+              <LongTermStats
+                days={daily.data.days}
+                definition={definition}
+              />
+            )}
+            <TrendChart
+              days={daily.data.days}
+              definition={definition}
+              height={340}
+            />
+          </>
         )}
       </article>
     </div>
@@ -1016,7 +1076,7 @@ function SourcesPage({ sources }: { sources: SourceInfo[] }) {
             <div className="source-metric-list">
               {source.metrics.map((metric) => (
                 <Link to={`/metrics/${metric.canonical_metric}`} key={metric.canonical_metric}>
-                  <span>{metric.canonical_metric}</span>
+                  <span>{metric.display_name ?? metric.canonical_metric}</span>
                   <strong>{metric.day_count.toLocaleString()} 天</strong>
                   <small>{metric.earliest_date} — {metric.latest_date}</small>
                 </Link>
@@ -1467,9 +1527,10 @@ function Shell({
       <HomePage meta={meta} source={source} sources={sources} onSource={onSource} />
     );
   } else if (metricMatch) {
+    const requestedMetric = decodeURIComponent(metricMatch[1]);
     pageContent = (
       <MetricPage
-        metricKey={decodeURIComponent(metricMatch[1])}
+        metricKey={requestedMetric === "activity" ? "steps" : requestedMetric}
         metrics={metrics}
         source={source}
         sources={sources}
