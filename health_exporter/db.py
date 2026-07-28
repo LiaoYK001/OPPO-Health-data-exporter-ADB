@@ -1179,6 +1179,27 @@ class Database:
             )
         ]
 
+    def metric_ui_evidence_dates(self, source_id: int, metric: str) -> list[str]:
+        """Return dates whose coverage payload confirms committed UI evidence."""
+
+        dates: list[str] = []
+        rows = self.connection.execute(
+            """
+            SELECT local_date, detail_json FROM coverage
+            WHERE source_id=? AND canonical_metric=?
+            ORDER BY local_date DESC
+            """,
+            (source_id, metric),
+        ).fetchall()
+        for row in rows:
+            try:
+                detail = json.loads(str(row["detail_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(detail, dict) and detail.get("ui") is True:
+                dates.append(str(row["local_date"]))
+        return dates
+
     def latest_source(self, vendor: str = "oppo") -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM sources WHERE vendor=? ORDER BY updated_at DESC LIMIT 1",

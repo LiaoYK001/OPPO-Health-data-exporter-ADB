@@ -251,6 +251,41 @@ def calendar_month_views(tree: UiTree) -> list[CalendarMonthView]:
         (node for node in tree.nodes if local_id(node) == "month_value"),
         key=lambda node: (parse_bounds(node.attrib.get("bounds", "")) or (0, 0, 0, 0))[1],
     )
+    # At a year boundary OPPO can keep December's clipped grid above a visible
+    # January heading. ``calendar_year_value`` then describes that clipped
+    # December, so January belongs to the following year. Without this
+    # correction the navigator alternates between "2021-01" and "2022-02"
+    # while trying to reach December 2021.
+    if month_nodes:
+        first_month_match = re.fullmatch(r"(\d{1,2})月", node_label(month_nodes[0]))
+        recycler = tree.by_id("recycler_view")
+        if first_month_match is not None and int(first_month_match.group(1)) == 1 and recycler is not None:
+            direct_child = month_nodes[0]
+            while (
+                direct_child in tree.parent
+                and tree.parent[direct_child] is not recycler
+            ):
+                direct_child = tree.parent[direct_child]
+            recycler_children = list(recycler)
+            try:
+                child_index = recycler_children.index(direct_child)
+            except ValueError:
+                child_index = 0
+            recycler_bounds = parse_bounds(recycler.attrib.get("bounds", ""))
+            has_clipped_prefix = False
+            if child_index > 0 and recycler_bounds is not None:
+                for sibling in recycler_children[:child_index]:
+                    sibling_bounds = parse_bounds(sibling.attrib.get("bounds", ""))
+                    if sibling_bounds is None:
+                        continue
+                    visible_height = min(sibling_bounds[3], recycler_bounds[3]) - max(
+                        sibling_bounds[1], recycler_bounds[1]
+                    )
+                    if visible_height > 24:
+                        has_clipped_prefix = True
+                        break
+            if has_clipped_prefix:
+                year += 1
     result: list[CalendarMonthView] = []
     previous_month: int | None = None
     for node in month_nodes:
@@ -1051,12 +1086,25 @@ class UiCollector:
         )
         pending: list[dt.date] = []
         skipped = 0
+        ui_evidence_lookup = getattr(self.db, "metric_ui_evidence_dates", None)
+        ui_evidence_dates = (
+            set(ui_evidence_lookup(self.source_id, metric))
+            if callable(ui_evidence_lookup)
+            else None
+        )
         for target in targets:
-            already_done = (
-                checkpoint_date is not None
-                and target >= checkpoint_date
-                and target != today
-            )
+            if ui_evidence_dates is not None:
+                # A sparse checkpoint only records the oldest successful target.
+                # A newer target may still have failed before a later success
+                # moved the checkpoint past it, so skip only committed UI dates.
+                already_done = target.isoformat() in ui_evidence_dates and target != today
+            else:
+                # Compatibility fallback for lightweight adapters/test doubles.
+                already_done = (
+                    checkpoint_date is not None
+                    and target >= checkpoint_date
+                    and target != today
+                )
             if already_done:
                 skipped += 1
             else:
@@ -2022,11 +2070,15 @@ class UiCollector:
                     # Use short, settled batches while far away, then verify
                     # every gesture near the target. Rapid 120 ms batches can
                     # reverse or overshoot RecyclerView while it is animating.
-                    if distance <= 3:
+                    if distance <= 6:
                         midpoint = (start_y + end_y) // 2
                         start_y = (start_y + midpoint) // 2
                         end_y = (end_y + midpoint) // 2
-                    swipe_count = 4 if distance > 6 else 2 if distance > 3 else 1
+                    # One settled gesture per observation prevents the calendar
+                    # from jumping across the target (for example 2021-01 ↔
+                    # 2022-05 while seeking 2021-10). Re-read semantic month
+                    # labels after every gesture and shorten it near the target.
+                    swipe_count = 1
                     for _ in range(swipe_count):
                         self.adb.swipe(
                             gesture_x,

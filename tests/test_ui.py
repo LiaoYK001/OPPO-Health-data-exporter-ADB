@@ -330,6 +330,32 @@ def test_calendar_month_views_reconstructs_year_across_december() -> None:
     assert [(item.year, item.month) for item in months] == [(2024, 12), (2025, 1)]
 
 
+def test_calendar_month_views_assigns_clipped_december_year_to_visible_january() -> None:
+    root = ET.fromstring(
+        """
+        <hierarchy>
+          <node text="2021年" resource-id="calendar_year_value"
+                bounds="[602,261][838,366]"/>
+          <node resource-id="recycler_view" scrollable="true"
+                bounds="[0,480][1440,2560]">
+            <node bounds="[0,480][1440,756]">
+              <node class="android.view.View" bounds="[76,480][1364,716]"/>
+            </node>
+            <node bounds="[0,756][1440,2560]">
+              <node text="1月" resource-id="month_value"
+                    bounds="[96,756][246,896]"/>
+              <node class="android.view.View" bounds="[76,985][1364,2560]"/>
+            </node>
+          </node>
+        </hierarchy>
+        """
+    )
+
+    months = calendar_month_views(UiTree(root))
+
+    assert [(item.year, item.month) for item in months] == [(2022, 1)]
+
+
 def test_calendar_day_point_maps_custom_canvas_cell() -> None:
     april = CalendarMonthView(
         year=2024,
@@ -503,6 +529,13 @@ def test_max_days_counts_new_attempts_not_checkpoint_skips() -> None:
         def get_checkpoint(self, _source_id: int, _metric: str) -> dict[str, str]:
             return {"last_date": self.last_date}
 
+        def metric_ui_evidence_dates(
+            self,
+            _source_id: int,
+            _metric: str,
+        ) -> list[str]:
+            return ["2026-07-20", "2026-07-15"]
+
         def set_coverage(self, *_args: object, **_kwargs: object) -> None:
             pass
 
@@ -633,6 +666,65 @@ def test_sparse_history_uses_calendar_only_for_pending_source_dates() -> None:
         "mode": "calendar_source_dates",
         "target_dates": 3,
     }
+
+
+def test_sparse_history_retries_failed_date_newer_than_checkpoint() -> None:
+    class FakeConnection:
+        def commit(self) -> None:
+            pass
+
+    class FakeDatabase:
+        connection = FakeConnection()
+
+        def metric_ui_evidence_dates(
+            self,
+            _source_id: int,
+            _metric: str,
+        ) -> list[str]:
+            return ["2025-12-07", "2023-08-06"]
+
+        def set_coverage(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def set_checkpoint(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def record_failure(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unexpected sparse retry failure")
+
+    collector = UiCollector.__new__(UiCollector)
+    collector.db = FakeDatabase()  # type: ignore[assignment]
+    collector.source_id = 1
+    collector.run_id = "sparse-retry-test"
+    captured: list[str] = []
+    collector._resume_via_calendar = (  # type: ignore[method-assign]
+        lambda _profile, target: target
+    )
+    collector.capture_page = (  # type: ignore[method-assign]
+        lambda _metric, day, _page_key, max_scrolls=12: captured.append(day) or 8
+    )
+    collector._capture_subpages = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    collector._has_source_day = lambda *_args: True  # type: ignore[method-assign]
+
+    result = collector._capture_sparse_dates(
+        "weight",
+        UI_PROFILES["weight"],
+        current_date=dt.date(2025, 12, 7),
+        earliest_date=dt.date(2023, 8, 6),
+        target_dates=(
+            dt.date(2025, 12, 7),
+            dt.date(2024, 11, 21),
+            dt.date(2023, 8, 6),
+        ),
+        checkpoint_date=dt.date(2023, 8, 6),
+        max_days=None,
+        capture_subpages=False,
+        max_scrolls=20,
+    )
+
+    assert captured == ["2024-11-21"]
+    assert result["captured"] == 1
+    assert result["skipped"] == 2
 
 
 def test_stalled_previous_day_recovers_through_calendar() -> None:
