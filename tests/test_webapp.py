@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -180,6 +181,69 @@ def test_activity_is_exposed_as_four_independent_metrics(tmp_path: Path) -> None
     assert details["workout_duration"]["data"]["series"] == {}
     assert details["active_count"]["data"]["series"] == {}
     assert legacy.status_code == 200
+
+
+def test_life_span_statistics_are_exact_while_trend_is_downsampled(
+    tmp_path: Path,
+) -> None:
+    data_dir, database = _database(tmp_path)
+    source_id, run_id = _source(database, "oppo", "oppo-install", 10)
+    first = dt.date(2025, 1, 1)
+    for offset in range(150):
+        database.upsert_daily_metric(
+            source_id=source_id,
+            canonical_metric="activity",
+            local_date=(first + dt.timedelta(days=offset)).isoformat(),
+            summary={"steps": offset + 1},
+            chart={"series": {}, "intervals": []},
+            fidelity="exact_source",
+            is_partial=False,
+            run_id=run_id,
+        )
+    database.connection.commit()
+    database.close()
+
+    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+        response = client.get(
+            "/api/v1/metrics/steps/daily",
+            params={
+                "from": "2025-01-01",
+                "to": "2025-05-30",
+                "max_points": 100,
+            },
+        )
+        short_range_limit = client.get(
+            "/api/v1/metrics/steps/daily",
+            params={
+                "from": "2025-01-01",
+                "to": "2025-05-30",
+                "max_points": 30,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["day_count"] == 150
+    assert payload["statistics"] == {
+        "field": "steps",
+        "unit": "步",
+        "recorded_days": 150,
+        "total": 11325.0,
+        "average": 75.5,
+        "minimum": 1.0,
+        "median": 75.5,
+        "maximum": 150.0,
+        "first_date": "2025-01-01",
+        "last_date": "2025-05-30",
+    }
+    assert payload["sampling"]["downsampled"] is True
+    assert payload["sampling"]["method"] == "lttb"
+    assert payload["sampling"]["returned_points"] == 100
+    assert len(payload["days"]) == 100
+    assert payload["days"][0]["local_date"] == "2025-01-01"
+    assert payload["days"][-1]["local_date"] == "2025-05-30"
+    assert short_range_limit.status_code == 200
+    assert short_range_limit.json()["sampling"]["returned_points"] == 30
 
 
 def test_web_api_prefers_fidelity_when_priorities_match(tmp_path: Path) -> None:

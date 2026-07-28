@@ -4,9 +4,11 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
+import statistics
 import sys
 import threading
 import time
@@ -70,13 +72,166 @@ def _date_range(date_from: str, date_to: str) -> tuple[str, str]:
     end = _date(date_to, "to")
     if start > end:
         raise HTTPException(400, "from 不能晚于 to")
-    if (dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days > 3700:
-        raise HTTPException(400, "单次查询范围不能超过 3700 天")
     return start, end
 
 
 def _rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
     return [dict(row) for row in cursor.fetchall()]
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) else None
+    return None
+
+
+def _field_statistics(
+    days: list[dict[str, Any]], field: str, unit: str
+) -> dict[str, Any]:
+    values = [
+        (str(day["local_date"]), value)
+        for day in days
+        if (value := _number(day.get("summary", {}).get(field))) is not None
+    ]
+    if not values:
+        return {
+            "field": field,
+            "unit": unit,
+            "recorded_days": 0,
+            "total": None,
+            "average": None,
+            "minimum": None,
+            "median": None,
+            "maximum": None,
+            "first_date": None,
+            "last_date": None,
+        }
+    numbers = [value for _, value in values]
+    total = sum(numbers)
+    return {
+        "field": field,
+        "unit": unit,
+        "recorded_days": len(numbers),
+        "total": total,
+        "average": total / len(numbers),
+        "minimum": min(numbers),
+        "median": statistics.median(numbers),
+        "maximum": max(numbers),
+        "first_date": values[0][0],
+        "last_date": values[-1][0],
+    }
+
+
+def _daily_statistics(
+    days: list[dict[str, Any]], definition: dict[str, Any]
+) -> dict[str, Any]:
+    result = _field_statistics(
+        days,
+        str(definition["primary_field"]),
+        str(definition.get("primary_unit", "")),
+    )
+    secondary_field = definition.get("secondary_field")
+    if secondary_field:
+        result["secondary"] = _field_statistics(
+            days,
+            str(secondary_field),
+            str(definition.get("primary_unit", "")),
+        )
+    return result
+
+
+def _sample_daily_points(
+    days: list[dict[str, Any]],
+    definition: dict[str, Any],
+    max_points: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    primary_field = str(definition["primary_field"])
+    points: list[tuple[int, float, float]] = []
+    for index, day in enumerate(days):
+        value = _number(day.get("summary", {}).get(primary_field))
+        if value is None:
+            continue
+        x_value = float(dt.date.fromisoformat(str(day["local_date"])).toordinal())
+        points.append((index, x_value, value))
+    if len(points) <= max_points or max_points < 3:
+        return days, {
+            "input_days": len(days),
+            "valid_points": len(points),
+            "returned_points": len(days),
+            "downsampled": False,
+            "method": "none",
+            "max_points": max_points,
+        }
+
+    threshold = max_points
+    every = (len(points) - 2) / (threshold - 2)
+    sampled_positions = [0]
+    anchor = 0
+    for bucket in range(threshold - 2):
+        average_start = int(math.floor((bucket + 1) * every)) + 1
+        average_end = int(math.floor((bucket + 2) * every)) + 1
+        average_end = min(average_end, len(points))
+        if average_start >= average_end:
+            average_start = min(average_start, len(points) - 1)
+            average_end = min(average_start + 1, len(points))
+        average_bucket = points[average_start:average_end]
+        average_x = sum(point[1] for point in average_bucket) / len(average_bucket)
+        average_y = sum(point[2] for point in average_bucket) / len(average_bucket)
+
+        range_start = int(math.floor(bucket * every)) + 1
+        range_end = int(math.floor((bucket + 1) * every)) + 1
+        range_end = min(range_end, len(points) - 1)
+        if range_start >= range_end:
+            range_end = min(range_start + 1, len(points) - 1)
+
+        anchor_x, anchor_y = points[anchor][1], points[anchor][2]
+        max_area = -1.0
+        next_anchor = range_start
+        for candidate in range(range_start, range_end):
+            point_x, point_y = points[candidate][1], points[candidate][2]
+            area = abs(
+                (anchor_x - average_x) * (point_y - anchor_y)
+                - (anchor_x - point_x) * (average_y - anchor_y)
+            )
+            if area > max_area:
+                max_area = area
+                next_anchor = candidate
+        sampled_positions.append(next_anchor)
+        anchor = next_anchor
+    sampled_positions.append(len(points) - 1)
+    sampled = [days[points[position][0]] for position in sampled_positions]
+    return sampled, {
+        "input_days": len(days),
+        "valid_points": len(points),
+        "returned_points": len(sampled),
+        "downsampled": True,
+        "method": "lttb",
+        "max_points": max_points,
+    }
+
+
+def _trend_day(
+    day: dict[str, Any], definition: dict[str, Any]
+) -> dict[str, Any]:
+    result = dict(day)
+    fields = [str(definition["primary_field"])]
+    if definition.get("secondary_field"):
+        fields.append(str(definition["secondary_field"]))
+    summary = day.get("summary", {})
+    result["summary"] = {
+        field: summary[field]
+        for field in fields
+        if field in summary
+    }
+    return result
 
 
 class WebAuth:
@@ -415,6 +570,7 @@ class WebDataService:
         date_from: str,
         date_to: str,
         source: str,
+        include_chart: bool = False,
     ) -> list[dict[str, Any]]:
         metric_list = list(metrics)
         unknown = [metric for metric in metric_list if metric not in METRIC_CATALOG]
@@ -427,11 +583,15 @@ class WebDataService:
         profile_id = self._profile_id(connection)
         source_clause, source_parameters = self._source_clause(source)
         placeholders = ",".join("?" for _ in storage_metrics)
+        chart_expression = "d.chart_json" if include_chart else "NULL"
         stored_rows = _rows(
             connection.execute(
                 f"""
                 SELECT d.id, d.source_id, d.canonical_metric, d.local_date,
-                       d.revision, d.summary_json, d.chart_json, d.fidelity,
+                       d.revision,
+                       json_remove(d.summary_json, '$.vendor_summaries')
+                           AS summary_json,
+                       {chart_expression} AS chart_json, d.fidelity,
                        d.is_partial, d.created_at, s.vendor, s.app_version,
                        COALESCE(ps.priority,0) AS source_priority,
                        COALESCE(ps.display_name, UPPER(s.vendor) || ' 健康') AS source_name
@@ -466,16 +626,25 @@ class WebDataService:
         rows: list[dict[str, Any]] = []
         for stored_row in stored_rows:
             stored_key = str(stored_row["canonical_metric"])
+            summary = self._public_summary(
+                _json(stored_row.get("summary_json"), {})
+            )
+            chart = (
+                _json(
+                    stored_row.get("chart_json"),
+                    {"series": {}, "intervals": []},
+                )
+                if include_chart
+                else {"series": {}, "intervals": []}
+            )
             for public_key in public_by_storage.get(stored_key, []):
                 row = dict(stored_row)
                 row["storage_metric"] = stored_key
                 row["canonical_metric"] = public_key
-                row["summary"] = self._public_summary(
-                    _json(row.pop("summary_json"), {})
-                )
-                row["chart"] = _json(
-                    row.pop("chart_json"), {"series": {}, "intervals": []}
-                )
+                row.pop("summary_json", None)
+                row.pop("chart_json", None)
+                row["summary"] = summary
+                row["chart"] = chart
                 row["partial"] = bool(row.pop("is_partial"))
                 row["fidelity_rank"] = FIDELITY_RANK.get(
                     str(row["fidelity"]), 0
@@ -519,7 +688,11 @@ class WebDataService:
         }
 
     def overview(
-        self, date_from: str, date_to: str, source: str
+        self,
+        date_from: str,
+        date_to: str,
+        source: str,
+        max_points: int = 720,
     ) -> dict[str, Any]:
         start, end = _date_range(date_from, date_to)
         with self.connection() as connection:
@@ -537,11 +710,18 @@ class WebDataService:
         metrics: dict[str, Any] = {}
         for metric, definition in visible_metrics().items():
             days = grouped.get(metric, [])
+            sampled_days, sampling = _sample_daily_points(
+                days, definition, max_points
+            )
             metrics[metric] = {
                 "definition": definition,
-                "days": days,
-                "latest": days[-1] if days else None,
+                "days": [
+                    _trend_day(day, definition) for day in sampled_days
+                ],
+                "latest": _trend_day(days[-1], definition) if days else None,
                 "day_count": len(days),
+                "statistics": _daily_statistics(days, definition),
+                "sampling": sampling,
             }
         return {
             "from": start,
@@ -551,7 +731,12 @@ class WebDataService:
         }
 
     def metric_daily(
-        self, metric: str, date_from: str, date_to: str, source: str
+        self,
+        metric: str,
+        date_from: str,
+        date_to: str,
+        source: str,
+        max_points: int = 900,
     ) -> dict[str, Any]:
         start, end = _date_range(date_from, date_to)
         with self.connection() as connection:
@@ -563,13 +748,20 @@ class WebDataService:
                 source=source,
             )
         selected = [self._compact_day(row) for row in self._selected(candidates)]
+        definition = METRIC_CATALOG[metric]
+        sampled, sampling = _sample_daily_points(
+            selected, definition, max_points
+        )
         return {
-            "metric": METRIC_CATALOG[metric],
+            "metric": definition,
             "from": start,
             "to": end,
             "source": source,
             "latest_date": selected[-1]["local_date"] if selected else None,
-            "days": selected,
+            "day_count": len(selected),
+            "statistics": _daily_statistics(selected, definition),
+            "sampling": sampling,
+            "days": [_trend_day(day, definition) for day in sampled],
         }
 
     def calendar(self, month: str, metric: str, source: str) -> dict[str, Any]:
@@ -669,6 +861,7 @@ class WebDataService:
                 date_from=day,
                 date_to=day,
                 source=source,
+                include_chart=True,
             )
             selected_rows = self._selected(candidates)
             selected = selected_rows[0] if selected_rows else None
@@ -1102,8 +1295,9 @@ def create_web_app(
         date_from: str = Query(alias="from"),
         date_to: str = Query(alias="to"),
         source: str = "unified",
+        max_points: int = Query(default=720, ge=3, le=2000),
     ) -> dict[str, Any]:
-        return service.overview(date_from, date_to, source)
+        return service.overview(date_from, date_to, source, max_points)
 
     @app.get("/api/v1/calendar")
     def calendar(
@@ -1119,8 +1313,11 @@ def create_web_app(
         date_from: str = Query(alias="from"),
         date_to: str = Query(alias="to"),
         source: str = "unified",
+        max_points: int = Query(default=900, ge=3, le=2000),
     ) -> dict[str, Any]:
-        return service.metric_daily(metric, date_from, date_to, source)
+        return service.metric_daily(
+            metric, date_from, date_to, source, max_points
+        )
 
     @app.get("/api/v1/metrics/{metric}/days/{local_date}")
     def metric_day(

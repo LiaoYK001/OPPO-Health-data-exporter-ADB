@@ -7,6 +7,38 @@ export class ApiError extends Error {
   }
 }
 
+export function apiErrorMessage(payload: unknown, status: number): string {
+  if (!payload || typeof payload !== "object" || !("detail" in payload)) {
+    return `请求失败（${status}）`;
+  }
+  const detail = (payload as { detail: unknown }).detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!item || typeof item !== "object") return String(item);
+        const record = item as { msg?: unknown; loc?: unknown };
+        const message =
+          typeof record.msg === "string" ? record.msg : JSON.stringify(item);
+        const location = Array.isArray(record.loc)
+          ? record.loc.slice(1).join(".")
+          : "";
+        return location ? `${location}：${message}` : message;
+      })
+      .filter(Boolean);
+    if (messages.length) return messages.join("；");
+  }
+  if (detail && typeof detail === "object" && "msg" in detail) {
+    const message = (detail as { msg?: unknown }).msg;
+    if (typeof message === "string") return message;
+  }
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return `请求失败（${status}）`;
+  }
+}
+
 export async function api<T>(
   path: string,
   options: RequestInit = {},
@@ -25,10 +57,7 @@ export async function api<T>(
     ? await response.json()
     : await response.text();
   if (!response.ok) {
-    const message =
-      typeof payload === "object" && payload?.detail
-        ? String(payload.detail)
-        : `请求失败（${response.status}）`;
+    const message = apiErrorMessage(payload, response.status);
     throw new ApiError(message, response.status);
   }
   return payload as T;

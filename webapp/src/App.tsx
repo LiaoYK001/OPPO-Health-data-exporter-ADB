@@ -11,9 +11,11 @@ import {
   Activity,
   Brain,
   CalendarDays,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Database,
+  Download,
   Droplets,
   Flame,
   Footprints,
@@ -22,7 +24,9 @@ import {
   LayoutDashboard,
   LockKeyhole,
   Menu,
+  Minus,
   MoonStar,
+  Plus,
   RefreshCw,
   Scale,
   Server,
@@ -40,15 +44,19 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { api, query } from "./api";
 import { Link, NavLink, useLocation } from "./router";
 import type {
   DayDetail,
   DayRecord,
+  Evidence,
   Meta,
   MetricDefinition,
   MetricInterval,
   Overview,
+  RangeStatistics,
+  SamplingInfo,
   SeriesPoint,
   SourceInfo,
 } from "./types";
@@ -84,6 +92,38 @@ const fidelityLabels: Record<string, string> = {
   no_data: "无数据",
   failed: "采集失败",
 };
+
+export const rangeOptions = [
+  { days: 7, label: "7 天" },
+  { days: 30, label: "30 天" },
+  { days: 90, label: "90 天" },
+  { days: 365, label: "1 年" },
+  { days: 730, label: "2 年" },
+  { days: 1095, label: "3 年" },
+  { days: 0, label: "Life span" },
+];
+
+function rangeStart(
+  latest: string,
+  earliest: string | null | undefined,
+  range: number,
+) {
+  return range === 0 ? earliest ?? latest : minusDays(latest, range - 1);
+}
+
+function rangeHeading(range: number) {
+  const option = rangeOptions.find((item) => item.days === range);
+  return range === 0 ? "全部历史" : `最近 ${option?.label ?? `${range} 天`}`;
+}
+
+export function rangeMaxPoints(
+  range: number,
+  surface: "overview" | "detail",
+) {
+  if (range > 0 && range <= 365) return range;
+  if (surface === "overview") return range === 0 ? 480 : 420;
+  return range === 0 ? 720 : 600;
+}
 
 const summaryFallbackLabels: Record<string, string> = {
   sleep_start_utc_ms: "入睡时间",
@@ -159,6 +199,39 @@ function primaryText(definition: MetricDefinition, day: DayRecord | null) {
   }
   if (definition.key === "blood_pressure" && definition.secondary_field) {
     const secondary = day.summary[definition.secondary_field];
+    if (secondary !== null && secondary !== undefined) {
+      return {
+        value: `${valueText(primary)} / ${valueText(secondary)}`,
+        unit: definition.primary_unit,
+      };
+    }
+  }
+  return { value: valueText(primary), unit: definition.primary_unit };
+}
+
+type StatisticKey = "average" | "minimum" | "median" | "maximum";
+
+export function statisticText(
+  definition: MetricDefinition,
+  statistics: RangeStatistics,
+  key: StatisticKey,
+) {
+  const primary = statistics[key];
+  if (primary === null || primary === undefined) {
+    return { value: "无记录", unit: "" };
+  }
+  if (definition.key === "sleep") {
+    const minutes = number(primary);
+    if (minutes !== null) {
+      const rounded = Math.round(minutes);
+      return {
+        value: `${Math.floor(rounded / 60)} 小时 ${rounded % 60} 分`,
+        unit: "",
+      };
+    }
+  }
+  if (definition.key === "blood_pressure" && definition.secondary_field) {
+    const secondary = statistics.secondary?.[key];
     if (secondary !== null && secondary !== undefined) {
       return {
         value: `${valueText(primary)} / ${valueText(secondary)}`,
@@ -395,36 +468,95 @@ function TrendChart({
 export function LongTermStats({
   days,
   definition,
+  statistics,
 }: {
   days: DayRecord[];
   definition: MetricDefinition;
+  statistics?: RangeStatistics;
 }) {
   const values = days
     .map((day) => number(day.summary[definition.primary_field]))
     .filter((value): value is number => value !== null);
-  if (!values.length) return null;
-  const total = values.reduce((sum, value) => sum + value, 0);
-  const average = total / values.length;
-  const maximum = Math.max(...values);
+  const fallbackTotal = values.reduce((sum, value) => sum + value, 0);
+  const sortedValues = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sortedValues.length / 2);
+  const fallbackMedian = sortedValues.length
+    ? sortedValues.length % 2
+      ? sortedValues[middle]
+      : (sortedValues[middle - 1] + sortedValues[middle]) / 2
+    : null;
+  const exact = statistics ?? {
+    field: definition.primary_field,
+    unit: definition.primary_unit,
+    recorded_days: values.length,
+    total: values.length ? fallbackTotal : null,
+    average: values.length ? fallbackTotal / values.length : null,
+    minimum: values.length ? Math.min(...values) : null,
+    median: fallbackMedian,
+    maximum: values.length ? Math.max(...values) : null,
+    first_date: null,
+    last_date: null,
+  };
+  if (!exact.recorded_days) return null;
+  const additive = definition.category === "activity";
   return (
     <section className="range-stat-grid" aria-label={`${definition.name}长期统计量`}>
       <article>
-        <span>所选范围总计</span>
-        <strong>{valueText(total, definition.primary_unit)}</strong>
+        <span>{additive ? "所选范围总计" : "所选范围平均"}</span>
+        <strong>
+          {valueText(
+            additive ? exact.total : exact.average,
+            definition.primary_unit,
+          )}
+        </strong>
       </article>
       <article>
-        <span>日均</span>
-        <strong>{valueText(average, definition.primary_unit)}</strong>
+        <span>{additive ? "日均" : "范围最低"}</span>
+        <strong>
+          {valueText(
+            additive ? exact.average : exact.minimum,
+            definition.primary_unit,
+          )}
+        </strong>
       </article>
       <article>
-        <span>单日最高</span>
-        <strong>{valueText(maximum, definition.primary_unit)}</strong>
+        <span>中位数</span>
+        <strong>{valueText(exact.median, definition.primary_unit)}</strong>
       </article>
+      <article>
+        <span>{additive ? "单日最低" : "范围最高"}</span>
+        <strong>
+          {valueText(
+            additive ? exact.minimum : exact.maximum,
+            definition.primary_unit,
+          )}
+        </strong>
+      </article>
+      {additive && (
+        <article>
+          <span>单日最高</span>
+          <strong>{valueText(exact.maximum, definition.primary_unit)}</strong>
+        </article>
+      )}
       <article>
         <span>有记录日</span>
-        <strong>{values.length.toLocaleString("zh-CN")} 天</strong>
+        <strong>{exact.recorded_days.toLocaleString("zh-CN")} 天</strong>
       </article>
     </section>
+  );
+}
+
+function SamplingNotice({ sampling }: { sampling: SamplingInfo }) {
+  if (!sampling.downsampled) return null;
+  return (
+    <div className="sampling-notice">
+      <Gauge size={16} />
+      <span>
+        为保证多年趋势流畅，图表从 {sampling.valid_points.toLocaleString("zh-CN")}{" "}
+        个日点中保留 {sampling.returned_points.toLocaleString("zh-CN")}{" "}
+        个代表点；上方统计仍按全部记录精确计算。
+      </span>
+    </div>
   );
 }
 
@@ -598,9 +730,10 @@ function HomePage({
   const latest = meta.latest_data_date;
   const path = latest
     ? query("/api/v1/overview", {
-        from: minusDays(latest, range - 1),
+        from: rangeStart(latest, meta.earliest_data_date, range),
         to: latest,
         source,
+        max_points: rangeMaxPoints(range, "overview"),
       })
     : null;
   const { data, error, loading } = useRemote<Overview>(path);
@@ -637,16 +770,16 @@ function HomePage({
       <div className="range-row">
         <div>
           <p className="section-label">健康速览</p>
-          <h2>最近 {range} 天</h2>
+          <h2>{rangeHeading(range)}</h2>
         </div>
-        <div className="segmented" aria-label="趋势范围">
-          {[7, 30, 90].map((days) => (
+        <div className="segmented range-segmented" aria-label="趋势范围">
+          {rangeOptions.map((option) => (
             <button
-              key={days}
-              className={range === days ? "active" : ""}
-              onClick={() => setRange(days)}
+              key={option.days}
+              className={range === option.days ? "active" : ""}
+              onClick={() => setRange(option.days)}
             >
-              {days} 天
+              {option.label}
             </button>
           ))}
         </div>
@@ -660,7 +793,26 @@ function HomePage({
             {Object.values(data.metrics).map((metric) => {
               const definition = metric.definition;
               const Icon = metricIcons[definition.key] ?? Activity;
-              const primary = primaryText(definition, metric.latest);
+              const average = statisticText(
+                definition,
+                metric.statistics,
+                "average",
+              );
+              const minimum = statisticText(
+                definition,
+                metric.statistics,
+                "minimum",
+              );
+              const median = statisticText(
+                definition,
+                metric.statistics,
+                "median",
+              );
+              const maximum = statisticText(
+                definition,
+                metric.statistics,
+                "maximum",
+              );
               return (
                 <Link
                   to={`/metrics/${definition.key}`}
@@ -673,19 +825,27 @@ function HomePage({
                     <span>{definition.name}</span>
                     <ChevronRight size={18} />
                   </div>
+                  <p className="metric-stat-label">所选时段平均值</p>
                   <div className="metric-value">
-                    <strong>{primary.value}</strong>
-                    {primary.unit && <span>{primary.unit}</span>}
+                    <strong>{average.value}</strong>
+                    {average.unit && <span>{average.unit}</span>}
                   </div>
-                  <div className="metric-date">
-                    {metric.latest ? (
-                      <>
-                        {dateLabel(metric.latest.local_date)}
-                        {metric.latest.partial && <i>未完成</i>}
-                      </>
+                  <div className="metric-stat-values">
+                    <div><span>最小</span><strong>{minimum.value}</strong></div>
+                    <div><span>中位</span><strong>{median.value}</strong></div>
+                    <div><span>最大</span><strong>{maximum.value}</strong></div>
+                  </div>
+                  <div className="metric-stat-period">
+                    {metric.statistics.first_date && metric.statistics.last_date ? (
+                      <span>
+                        {metric.statistics.first_date} — {metric.statistics.last_date}
+                      </span>
                     ) : (
-                      "没有记录"
+                      <span>没有记录</span>
                     )}
+                    <strong>
+                      {metric.statistics.recorded_days.toLocaleString("zh-CN")} 天
+                    </strong>
                   </div>
                   <MiniBars days={metric.days} definition={definition} />
                 </Link>
@@ -705,10 +865,13 @@ function HomePage({
                 </Link>
               </div>
               {stepsMetric ? (
-                <TrendChart
-                  days={stepsMetric.days}
-                  definition={stepsMetric.definition}
-                />
+                <>
+                  <SamplingNotice sampling={stepsMetric.sampling} />
+                  <TrendChart
+                    days={stepsMetric.days}
+                    definition={stepsMetric.definition}
+                  />
+                </>
               ) : (
                 <EmptyBlock />
               )}
@@ -751,6 +914,243 @@ function HomePage({
   );
 }
 
+export function EvidenceGallery({ items }: { items: Evidence[] }) {
+  const images = useMemo(
+    () =>
+      items.filter(
+        (item, index, list) =>
+          item.media_type.startsWith("image/") &&
+          list.findIndex((other) => other.sha256 === item.sha256) === index,
+      ),
+    [items],
+  );
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [zoom, setZoom] = useState(0);
+  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  const selected =
+    selectedIndex === null ? null : images[selectedIndex] ?? null;
+
+  const move = useCallback(
+    (direction: number) => {
+      setSelectedIndex((current) => {
+        if (current === null || images.length < 2) return current;
+        return (current + direction + images.length) % images.length;
+      });
+      setZoom(0);
+      setNaturalSize({ width: 0, height: 0 });
+    },
+    [images.length],
+  );
+
+  const close = useCallback(() => {
+    setSelectedIndex(null);
+    setZoom(0);
+    setNaturalSize({ width: 0, height: 0 });
+  }, []);
+
+  useEffect(() => {
+    if (selectedIndex === null) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+      else if (event.key === "ArrowLeft") move(-1);
+      else if (event.key === "ArrowRight") move(1);
+      else if (event.key === "+" || event.key === "=") {
+        setZoom((value) => Math.min(value === 0 ? 1 : value + 0.25, 3));
+      } else if (event.key === "-") {
+        setZoom((value) => (value <= 1 ? 0 : Math.max(value - 0.25, 0.5)));
+      } else if (event.key === "0") {
+        setZoom(0);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [close, move, selectedIndex]);
+
+  if (!images.length) return null;
+
+  return (
+    <>
+      <details className="panel evidence-panel">
+        <summary>
+          <span>
+            <p className="section-label">SOURCE EVIDENCE</p>
+            <strong>查看 APP 页面证据</strong>
+            <small>点击缩略图查看完整原图</small>
+          </span>
+          <Badge tone="neutral">{images.length} 张</Badge>
+        </summary>
+        <div className="evidence-grid">
+          {images.map((item, index) => (
+            <figure key={item.sha256}>
+              <button
+                type="button"
+                className="evidence-thumbnail"
+                onClick={() => {
+                  setSelectedIndex(index);
+                  setZoom(0);
+                }}
+                aria-label={`查看完整图像：${item.page_key} ${item.role}`}
+              >
+                <img
+                  src={`/api/v1/artifacts/${item.sha256}`}
+                  alt={`${item.page_key} ${item.role}`}
+                  loading="lazy"
+                />
+                <span>点击查看完整图像</span>
+              </button>
+              <figcaption>
+                {item.page_key}
+                <span>{item.role}</span>
+                {item.width && item.height && (
+                  <small>
+                    {item.width} × {item.height}
+                  </small>
+                )}
+              </figcaption>
+            </figure>
+          ))}
+        </div>
+      </details>
+
+      {selected &&
+        createPortal(
+          <div
+            className="evidence-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label="APP 页面证据完整图像"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) close();
+            }}
+          >
+            <header className="evidence-lightbox-header">
+              <div>
+                <strong>{selected.page_key}</strong>
+                <span>
+                  {selected.role}
+                  {selected.width && selected.height
+                    ? ` · ${selected.width} × ${selected.height}`
+                    : ""}
+                  {selectedIndex !== null
+                    ? ` · ${selectedIndex + 1} / ${images.length}`
+                    : ""}
+                </span>
+              </div>
+              <div className="evidence-lightbox-actions">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setZoom((value) =>
+                      value <= 1 ? 0 : Math.max(value - 0.25, 0.5),
+                    )
+                  }
+                  aria-label="缩小图像"
+                >
+                  <Minus size={18} />
+                </button>
+                <button
+                  type="button"
+                  className="zoom-label"
+                  onClick={() => setZoom(0)}
+                  aria-label="适应窗口"
+                >
+                  {zoom === 0 ? "适应窗口" : `${Math.round(zoom * 100)}%`}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setZoom((value) =>
+                      Math.min(value === 0 ? 1 : value + 0.25, 3),
+                    )
+                  }
+                  aria-label="放大图像"
+                >
+                  <Plus size={18} />
+                </button>
+                <a
+                  href={`/api/v1/artifacts/${selected.sha256}`}
+                  download
+                  aria-label="下载原图"
+                >
+                  <Download size={18} />
+                  <span>原图</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={close}
+                  aria-label="关闭完整图像"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </header>
+            <div
+              className={`evidence-lightbox-stage ${zoom > 0 ? "zoomed" : ""}`}
+            >
+              {images.length > 1 && (
+                <button
+                  type="button"
+                  className="evidence-lightbox-nav previous"
+                  onClick={() => move(-1)}
+                  aria-label="上一张证据"
+                >
+                  <ChevronLeft size={24} />
+                </button>
+              )}
+              <img
+                key={selected.sha256}
+                src={`/api/v1/artifacts/${selected.sha256}`}
+                alt={`${selected.page_key} ${selected.role} 完整图像`}
+                onLoad={(event) =>
+                  setNaturalSize({
+                    width: event.currentTarget.naturalWidth,
+                    height: event.currentTarget.naturalHeight,
+                  })
+                }
+                style={
+                  zoom > 0 && naturalSize.width
+                    ? {
+                        width: naturalSize.width * zoom,
+                        height: naturalSize.height * zoom,
+                        maxWidth: "none",
+                        maxHeight: "none",
+                      }
+                    : undefined
+                }
+              />
+              {images.length > 1 && (
+                <button
+                  type="button"
+                  className="evidence-lightbox-nav next"
+                  onClick={() => move(1)}
+                  aria-label="下一张证据"
+                >
+                  <ChevronRight size={24} />
+                </button>
+              )}
+            </div>
+            <footer>
+              <span>滚动查看长图；方向键切换；+ / − 缩放；0 适应窗口；Esc 关闭</span>
+              <a
+                href={`/api/v1/artifacts/${selected.sha256}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                在新窗口打开完整图像
+              </a>
+            </footer>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
 function MetricPage({
   metricKey,
   metrics,
@@ -774,12 +1174,14 @@ function MetricPage({
   const dailyPath =
     definition && latestAvailable
       ? query(`/api/v1/metrics/${metricKey}/daily`, {
-          from:
-            range === 0
-              ? definition.availability?.earliest_date ?? latestAvailable
-              : minusDays(latestAvailable, range - 1),
+          from: rangeStart(
+            latestAvailable,
+            definition.availability?.earliest_date,
+            range,
+          ),
           to: latestAvailable,
           source,
+          max_points: rangeMaxPoints(range, "detail"),
         })
       : null;
   const detailPath =
@@ -790,6 +1192,9 @@ function MetricPage({
     metric: MetricDefinition;
     days: DayRecord[];
     latest_date: string | null;
+    day_count: number;
+    statistics: RangeStatistics;
+    sampling: SamplingInfo;
   }>(dailyPath);
   const detail = useRemote<DayDetail>(detailPath);
 
@@ -842,19 +1247,14 @@ function MetricPage({
             onChange={(event) => setSelectedDate(event.target.value)}
           />
         </label>
-        <div className="segmented">
-          {[
-            [30, "30 天"],
-            [90, "90 天"],
-            [365, "1 年"],
-            [0, "全部"],
-          ].map(([value, label]) => (
+        <div className="segmented range-segmented">
+          {rangeOptions.map((option) => (
             <button
-              key={value}
-              className={range === value ? "active" : ""}
-              onClick={() => setRange(Number(value))}
+              key={option.days}
+              className={range === option.days ? "active" : ""}
+              onClick={() => setRange(option.days)}
             >
-              {label}
+              {option.label}
             </button>
           ))}
         </div>
@@ -975,39 +1375,7 @@ function MetricPage({
           {detail.data.data.evidence.some((item) =>
             item.media_type.startsWith("image/"),
           ) && (
-            <details className="panel evidence-panel">
-              <summary>
-                <span>
-                  <p className="section-label">SOURCE EVIDENCE</p>
-                  <strong>查看 APP 页面证据</strong>
-                </span>
-                <Badge tone="neutral">
-                  {detail.data.data.evidence.filter((item) => item.media_type.startsWith("image/")).length} 张
-                </Badge>
-              </summary>
-              <div className="evidence-grid">
-                {detail.data.data.evidence
-                  .filter(
-                    (item, index, list) =>
-                      item.media_type.startsWith("image/") &&
-                      list.findIndex((other) => other.sha256 === item.sha256) === index,
-                  )
-                  .slice(0, 8)
-                  .map((item) => (
-                    <figure key={item.sha256}>
-                      <img
-                        src={`/api/v1/artifacts/${item.sha256}`}
-                        alt={`${item.page_key} ${item.role}`}
-                        loading="lazy"
-                      />
-                      <figcaption>
-                        {item.page_key}
-                        <span>{item.role}</span>
-                      </figcaption>
-                    </figure>
-                  ))}
-              </div>
-            </details>
+            <EvidenceGallery items={detail.data.data.evidence} />
           )}
         </>
       )}
@@ -1016,20 +1384,20 @@ function MetricPage({
         <div className="panel-heading">
           <div>
             <p className="section-label">LONGITUDINAL VIEW</p>
-            <h2>长期趋势</h2>
+            <h2>{range === 0 ? "Life span 全历史统计" : `${rangeHeading(range)}趋势`}</h2>
           </div>
-          {daily.data && <Badge>{daily.data.days.length} 个有记录日</Badge>}
+          {daily.data && <Badge>{daily.data.day_count} 个有记录日</Badge>}
         </div>
         {daily.loading && <LoadingBlock />}
         {daily.error && <ErrorBlock message={daily.error} />}
         {daily.data && (
           <>
-            {definition.long_term_stats && (
-              <LongTermStats
-                days={daily.data.days}
-                definition={definition}
-              />
-            )}
+            <LongTermStats
+              days={daily.data.days}
+              definition={definition}
+              statistics={daily.data.statistics}
+            />
+            <SamplingNotice sampling={daily.data.sampling} />
             <TrendChart
               days={daily.data.days}
               definition={definition}

@@ -49,6 +49,29 @@ export interface DayRecord {
   created_at: string;
 }
 
+export interface RangeStatistics {
+  field: string;
+  unit: string;
+  recorded_days: number;
+  total: number | null;
+  average: number | null;
+  minimum: number | null;
+  median: number | null;
+  maximum: number | null;
+  first_date: string | null;
+  last_date: string | null;
+  secondary?: RangeStatistics;
+}
+
+export interface SamplingInfo {
+  input_days: number;
+  valid_points: number;
+  returned_points: number;
+  downsampled: boolean;
+  method: "none" | "lttb";
+  max_points: number;
+}
+
 export interface Meta {
   api_version: string;
   app_version: string;
@@ -68,6 +91,8 @@ export interface OverviewMetric {
   days: DayRecord[];
   latest: DayRecord | null;
   day_count: number;
+  statistics: RangeStatistics;
+  sampling: SamplingInfo;
 }
 
 export interface Overview {

@@ -411,6 +411,16 @@ input {
   box-shadow: 0 3px 10px rgba(29, 58, 43, 0.09);
 }
 
+.range-segmented {
+  max-width: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.range-segmented button {
+  white-space: nowrap;
+}
+
 .metric-card-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -420,9 +430,9 @@ input {
 .metric-card {
   position: relative;
   min-width: 0;
-  min-height: 194px;
+  min-height: 286px;
   overflow: hidden;
-  padding: 17px;
+  padding: 17px 17px 66px;
   border: 1px solid var(--line);
   border-radius: 17px;
   background: var(--surface);
@@ -464,14 +474,14 @@ input {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  margin-top: 19px;
+  margin-top: 6px;
 }
 
 .metric-value strong {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
-  font-size: clamp(22px, 2.4vw, 30px);
+  font-size: clamp(30px, 3vw, 39px);
   line-height: 1.1;
   letter-spacing: -0.04em;
   text-overflow: ellipsis;
@@ -483,17 +493,68 @@ input {
   font-size: 10px;
 }
 
-.metric-date {
-  min-height: 18px;
-  margin-top: 7px;
+.metric-stat-label {
+  margin: 18px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
-.metric-date i {
-  margin-left: 5px;
-  color: #a37119;
-  font-style: normal;
+.metric-stat-values {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 13px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.metric-stat-values div {
+  min-width: 0;
+}
+
+.metric-stat-values span,
+.metric-stat-values strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-stat-values span {
+  color: var(--muted-2);
+  font-size: 8px;
+}
+
+.metric-stat-values strong {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.metric-stat-period {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.metric-stat-period span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-stat-period strong {
+  flex: 0 0 auto;
+  color: var(--muted-2);
+  font-size: 8px;
 }
 
 .mini-bars {
@@ -841,7 +902,7 @@ input {
 
 .range-stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 9px;
   margin: 2px 0 18px;
 }
@@ -869,6 +930,25 @@ input {
   overflow: hidden;
   font-size: 16px;
   text-overflow: ellipsis;
+}
+
+.sampling-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--metric, var(--green)) 5%, var(--surface));
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.sampling-notice svg {
+  flex: 0 0 auto;
+  color: var(--metric, var(--green-dark));
 }
 
 .quality-notice {
@@ -1046,6 +1126,14 @@ input {
   font-size: 18px;
 }
 
+.evidence-panel > summary small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
 .evidence-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1061,12 +1149,55 @@ input {
   background: #111;
 }
 
-.evidence-grid img {
+.evidence-thumbnail {
+  position: relative;
+  width: 100%;
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  color: #fff;
+  border: 0;
+  background: #2e302f;
+  cursor: zoom-in;
+}
+
+.evidence-thumbnail img {
   width: 100%;
   aspect-ratio: 9 / 14;
   display: block;
   object-fit: cover;
   object-position: top;
+  transition: transform 180ms ease, opacity 180ms ease;
+}
+
+.evidence-thumbnail > span {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  padding: 7px 9px;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 8px;
+  background: rgba(7, 13, 10, 0.76);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.2);
+  font-size: 9px;
+  font-weight: 700;
+  opacity: 0;
+  transform: translateY(5px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.evidence-thumbnail:hover img,
+.evidence-thumbnail:focus-visible img {
+  opacity: 0.82;
+  transform: scale(1.02);
+}
+
+.evidence-thumbnail:hover > span,
+.evidence-thumbnail:focus-visible > span {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .evidence-grid figcaption {
@@ -1082,6 +1213,156 @@ input {
   display: block;
   margin-top: 3px;
   color: #8f9a95;
+}
+
+.evidence-grid figcaption small {
+  display: block;
+  margin-top: 4px;
+  color: #65716b;
+}
+
+.evidence-lightbox {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  color: #f4f8f6;
+  background: rgba(5, 8, 7, 0.96);
+  backdrop-filter: blur(12px);
+}
+
+.evidence-lightbox-header {
+  min-height: 66px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 10px 16px 10px 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(12, 17, 14, 0.9);
+}
+
+.evidence-lightbox-header > div:first-child {
+  min-width: 0;
+}
+
+.evidence-lightbox-header strong,
+.evidence-lightbox-header span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidence-lightbox-header strong {
+  font-size: 13px;
+}
+
+.evidence-lightbox-header span {
+  margin-top: 4px;
+  color: #9eaaa4;
+  font-size: 10px;
+}
+
+.evidence-lightbox-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.evidence-lightbox-actions button,
+.evidence-lightbox-actions a,
+.evidence-lightbox-nav {
+  min-width: 38px;
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: #eef5f1;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.07);
+  cursor: pointer;
+}
+
+.evidence-lightbox-actions button:hover,
+.evidence-lightbox-actions a:hover,
+.evidence-lightbox-nav:hover {
+  border-color: rgba(88, 218, 156, 0.55);
+  background: rgba(43, 199, 128, 0.15);
+}
+
+.evidence-lightbox-actions .zoom-label {
+  min-width: 76px;
+  color: #b8c8c0;
+  font-size: 10px;
+}
+
+.evidence-lightbox-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px 68px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.evidence-lightbox-stage.zoomed {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.evidence-lightbox-stage.zoomed > img {
+  margin: 0 auto;
+}
+
+.evidence-lightbox-stage > img {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  object-fit: contain;
+  box-shadow: 0 10px 60px rgba(0, 0, 0, 0.48);
+}
+
+.evidence-lightbox-nav {
+  position: fixed;
+  z-index: 2;
+  top: 50%;
+  border-radius: 50%;
+  transform: translateY(-50%);
+}
+
+.evidence-lightbox-nav.previous {
+  left: 15px;
+}
+
+.evidence-lightbox-nav.next {
+  right: 15px;
+}
+
+.evidence-lightbox > footer {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 20px;
+  color: #87938d;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(12, 17, 14, 0.88);
+  font-size: 9px;
+}
+
+.evidence-lightbox > footer a {
+  color: #63d8a3;
+  font-weight: 700;
 }
 
 .source-grid {
@@ -1834,8 +2115,9 @@ td small {
   }
 
   .metric-card {
-    min-height: 175px;
+    min-height: 276px;
     padding: 14px;
+    padding-bottom: 62px;
   }
 
   .metric-card-head {
@@ -1873,8 +2155,16 @@ td small {
     width: 100%;
   }
 
-  .metric-toolbar .segmented button {
-    flex: 1;
+  .range-segmented {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .metric-toolbar .range-segmented button {
+    flex: 0 0 auto;
   }
 
   .day-hero {
@@ -1906,6 +2196,61 @@ td small {
 
   .evidence-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .evidence-lightbox-header {
+    min-height: 58px;
+    padding: 8px 9px 8px 12px;
+  }
+
+  .evidence-lightbox-header > div:first-child {
+    max-width: 35vw;
+  }
+
+  .evidence-lightbox-actions {
+    gap: 4px;
+  }
+
+  .evidence-lightbox-actions button,
+  .evidence-lightbox-actions a {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 7px;
+  }
+
+  .evidence-lightbox-actions .zoom-label {
+    min-width: 62px;
+  }
+
+  .evidence-lightbox-actions a span {
+    display: none;
+  }
+
+  .evidence-lightbox-stage {
+    padding: 12px 42px;
+  }
+
+  .evidence-lightbox-nav {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+  }
+
+  .evidence-lightbox-nav.previous {
+    left: 5px;
+  }
+
+  .evidence-lightbox-nav.next {
+    right: 5px;
+  }
+
+  .evidence-lightbox > footer {
+    justify-content: flex-end;
+    padding: 8px 12px;
+  }
+
+  .evidence-lightbox > footer > span {
+    display: none;
   }
 
   .source-card {
@@ -2013,7 +2358,7 @@ td small {
   }
 
   .metric-card {
-    min-height: 154px;
+    min-height: 258px;
   }
 
   .mini-bars {
