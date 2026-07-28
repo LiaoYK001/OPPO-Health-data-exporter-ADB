@@ -50,6 +50,13 @@ DAILY_TABLES = {
     "dbstressdatastattable",
 }
 
+OPPO_SLEEP_STAGE_STATES = {
+    "0": "awake",
+    "2": "deep",
+    "3": "rem",
+    "4": "light",
+}
+
 STAT_SUMMARY_MAPS: dict[str, dict[str, tuple[str, str | None]]] = {
     "dbsportdatastat": {
         "steps": ("total_steps", "count"),
@@ -573,13 +580,19 @@ class OppoNormalizer:
         if start is None or end is None or end < start:
             return
         state = payload.get("sleep_state", payload.get("type", payload.get("sleep_type")))
-        state_text = None if state is None else str(state)
+        vendor_state = None if state is None else str(state)
+        state_text = (
+            OPPO_SLEEP_STAGE_STATES.get(vendor_state, vendor_state)
+            if vendor_state is not None
+            else None
+        )
         metadata = {
             key: payload[key]
             for key in ("sleep_type", "sleep_state", "alg_origin_state", "type", "stage_sleep_end", "data_version")
             if key in payload
         }
         metadata["source_table"] = source_table
+        metadata["vendor_state"] = vendor_state
         self.db.add_interval(
             metric_record_id=record_id,
             interval_kind="sleep_stage",

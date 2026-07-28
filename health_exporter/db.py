@@ -15,7 +15,7 @@ from .constants import FIDELITY_VALUES
 from .errors import ExporterError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 COVERAGE_STATUS_PRIORITY = {
     "failed": 0,
@@ -66,6 +66,26 @@ CREATE TABLE IF NOT EXISTS devices (
     metadata_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(source_id, device_hash)
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile_sources (
+    profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, source_id)
 );
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
@@ -284,6 +304,14 @@ CREATE INDEX IF NOT EXISTS idx_intervals_time
 ON metric_intervals(interval_kind, start_utc_ms, end_utc_ms);
 CREATE INDEX IF NOT EXISTS idx_coverage_status
 ON coverage(source_id, status, local_date);
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_date_created
+ON daily_metrics(local_date, created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_created
+ON daily_metrics(created_at);
+CREATE INDEX IF NOT EXISTS idx_page_captures_date_created
+ON page_captures(local_date, created_at);
+CREATE INDEX IF NOT EXISTS idx_page_captures_created
+ON page_captures(created_at);
 """
 
 
@@ -368,6 +396,99 @@ class Database:
             )
             self.connection.execute("PRAGMA user_version=3")
             self.connection.commit()
+            current = 3
+        if current < 4:
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_key TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS profile_sources (
+                    profile_id INTEGER NOT NULL
+                        REFERENCES profiles(id) ON DELETE CASCADE,
+                    source_id INTEGER NOT NULL
+                        REFERENCES sources(id) ON DELETE CASCADE,
+                    display_name TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(profile_id, source_id)
+                );
+                """
+            )
+            now = utc_now()
+            timezone_row = self.connection.execute(
+                "SELECT timezone FROM sources ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+            timezone = str(timezone_row[0]) if timezone_row else "Asia/Shanghai"
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO profiles(
+                    profile_key, display_name, timezone, created_at, updated_at
+                ) VALUES('default', '我的健康档案', ?, ?, ?)
+                """,
+                (timezone, now, now),
+            )
+            profile_id = int(
+                self.connection.execute(
+                    "SELECT id FROM profiles WHERE profile_key='default'"
+                ).fetchone()[0]
+            )
+            source_rows = self.connection.execute(
+                "SELECT id, vendor FROM sources ORDER BY id"
+            ).fetchall()
+            for source in source_rows:
+                source_id = int(source[0])
+                vendor = str(source[1]).upper()
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO profile_sources(
+                        profile_id, source_id, display_name, priority,
+                        enabled, created_at, updated_at
+                    ) VALUES(?,?,?,?,1,?,?)
+                    """,
+                    (
+                        profile_id,
+                        source_id,
+                        f"{vendor} 健康",
+                        max(1000 - source_id, 0),
+                        now,
+                        now,
+                    ),
+                )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (4, now),
+            )
+            self.connection.execute("PRAGMA user_version=4")
+            self.connection.commit()
+            current = 4
+        if current < 5:
+            self.connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_daily_metrics_date_created
+                ON daily_metrics(local_date, created_at);
+                CREATE INDEX IF NOT EXISTS idx_daily_metrics_created
+                ON daily_metrics(created_at);
+                CREATE INDEX IF NOT EXISTS idx_page_captures_date_created
+                ON page_captures(local_date, created_at);
+                CREATE INDEX IF NOT EXISTS idx_page_captures_created
+                ON page_captures(created_at);
+                """
+            )
+            now = utc_now()
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (5, now),
+            )
+            self.connection.execute("PRAGMA user_version=5")
+            self.connection.commit()
 
     def _load_or_create_salt(self) -> bytes:
         salt_path = self.private_dir / "id_salt.bin"
@@ -447,7 +568,30 @@ class Database:
             "SELECT id FROM sources WHERE vendor=? AND app_package=? AND installation_hash=?",
             (vendor, app_package, installation_hash),
         ).fetchone()
-        return int(row["id"])
+        source_id = int(row["id"])
+        profile = self.connection.execute(
+            "SELECT id FROM profiles WHERE profile_key='default'"
+        ).fetchone()
+        if profile is not None:
+            now = utc_now()
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO profile_sources(
+                    profile_id, source_id, display_name, priority,
+                    enabled, created_at, updated_at
+                ) VALUES(?,?,?,?,1,?,?)
+                """,
+                (
+                    int(profile["id"]),
+                    source_id,
+                    f"{vendor.upper()} 健康",
+                    max(1000 - source_id, 0),
+                    now,
+                    now,
+                ),
+            )
+            self.connection.commit()
+        return source_id
 
     def update_source_account(self, source_id: int, account_value: str) -> str:
         account_hash = self.pseudonymize(account_value)

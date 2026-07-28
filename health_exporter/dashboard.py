@@ -471,19 +471,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def serve_dashboard(args: argparse.Namespace) -> int:
-    workspace = Path.cwd()
-    state = DashboardState(workspace, args.data_dir, args.serial)
-    server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    server.dashboard_state = state  # type: ignore[attr-defined]
-    url = f"http://{args.host}:{server.server_port}/"
-    print(f"OPPO 健康采集监控面板：{url}", flush=True)
-    print("仅监听本机；按 Ctrl+C 关闭面板。", flush=True)
-    if args.open:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return 0
+    from .webapp import serve_web
+
+    return serve_web(args, initial_path="/admin/collector")

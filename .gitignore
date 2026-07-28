@@ -8,3 +8,7 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 /document/req
+/webapp/node_modules/
+/webapp/*.tsbuildinfo
+/build/
+/dist/

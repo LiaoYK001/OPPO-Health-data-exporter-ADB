@@ -1,6 +1,6 @@
-# OPPO 健康全细节导出器（MuMu + ADB）
+# 多品牌健康数据中枢（OPPO / MuMu + ADB）
 
-本项目采用两条采集通道：Root 阶段保存 OPPO 健康的数据库、WAL/SHM 和完整原始行；非 Root 阶段通过 ADB 遍历“健康”页及指标详情，保存逐屏 PNG、UI XML、长图、图表裁剪和页面文字。规范层统一写入 SQLite，并可重复导出日级 CSV/XLSX。
+本项目是本地优先的多品牌健康与运动数据归一化平台。当前 OPPO 适配器采用两条采集通道：Root 阶段保存 OPPO 健康的数据库、WAL/SHM 和完整原始行；非 Root 阶段通过 ADB 遍历“健康”页及指标详情，保存逐屏 PNG、UI XML、长图、图表裁剪和页面文字。所有厂商数据写入同一套 SQLite 规范层，并可通过响应式 Web、CSV 和 XLSX 持续查看。未来接入小米健康或华为健康时，已有历史不需要搬迁或覆盖。
 
 > OPPO 健康 6.5.4 会检测 Root 并主动退出。不要长期保持 Root，也不要安装 Root 隐藏模块。采集必须分成两个阶段。
 
@@ -95,15 +95,55 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 
 如果电脑已经死机、断电或强制重启，无法提前执行暂停脚本，开机后仍按“开机后恢复采集”的步骤操作。恢复脚本会把没有对应存活进程的旧 `running` 批次改为 `interrupted`，再从最后一次成功提交的 checkpoint 继续。最坏情况下只会重新采集最后一个未完整提交的日期；已完成历史日期、原始证据和旧版本不会被覆盖。
 
+## 统一健康 Web
+
+Web 应用只读取本机 SQLite 和内容寻址素材，不会修改健康数据、控制模拟器或把数据发送到外网。默认仅供这台电脑访问：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+```
+
+也可直接运行：
+
+```powershell
+python .\ohealth_exporter.py web --open
+```
+
+浏览器会打开 `http://127.0.0.1:8765/`。页面包括：
+
+- 健康总览：按 7/30/90 天浏览活动、心率、睡眠、血氧、血压、体重和压力；
+- 指标详情：长期日级趋势、单日精细采样、睡眠阶段、目标、评分和页面证据；
+- 数据来源：厂商、APP 版本、脱敏设备、数据范围和来源优先级；
+- 数据质量：保真等级、无数据日期、精细序列覆盖与未解决验真差异；
+- 采集管理：ADB/Root/APP 状态、checkpoint、详细日志和每秒操作事件。
+
+Web 会明确区分“数值为 0”“没有记录”和“只有日汇总”。如果历史日期缺少精细序列，页面会展示缺口说明，不会根据截图高度估算数值。
+
+### 手机和平板局域网访问
+
+只有需要同一局域网内的手机或平板访问时才开启 `-Lan`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB" -Lan
+```
+
+首次启动会在终端要求设置至少 8 位的访问密码。密码使用随机盐和 `scrypt` 保存为本地哈希，浏览器登录后使用 HttpOnly 会话 Cookie；服务重启后需重新登录。手机访问地址为 `http://<这台电脑的局域网IP>:8765/`。只应在可信家庭局域网使用，不要进行公网端口映射或隧道转发。
+
+需要重新设置密码时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB" -Lan -ResetPassword
+```
+
 ### 本地可视化监控与调试日志
 
-监控页只读取本机 SQLite、素材、运行进程和 `data\logs\`，不会启动、停止或操作采集器，也不会把健康数据发送到外网。在项目目录执行：
+原有监控命令继续兼容，并会直接进入新 Web 的“采集管理”页面：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
 ```
 
-浏览器会打开 `http://127.0.0.1:8765/`。页面可选择 1 秒、2 秒或 5 秒刷新，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、批次记录、未解决失败、素材数量和容量、日历跳转证据，以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
+浏览器会打开 `http://127.0.0.1:8765/admin/collector`。页面每秒刷新，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、未解决失败、素材数量和容量、实时事件流以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
 
 “实时详细操作”单独读取 `data/logs/operation-events.jsonl`。采集器会为进入指标、读取日期、打开/滚动日历、点击日期、逐屏滚动、保存 PNG/XML、进入和退出子页面、提交页面/checkpoint、回退及失败分别写入结构化事件。每条事件包含本地毫秒时间戳、`DEBUG/INFO/WARNING/ERROR` 级别、run ID、指标、日期、当前页面/Activity、动作、结果和附加上下文。页面支持级别筛选、100/300/1000 条尾部范围和自动滚到底部；选择 1 秒即为最快实时刷新。
 
@@ -113,7 +153,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps
 python .\ohealth_exporter.py dashboard --open
 ```
 
-监控服务默认只监听 `127.0.0.1`。因为页面包含个人健康采集状态和日志，不要改成公网监听地址，也不要通过公网隧道转发。
+`dashboard` 兼容命令始终只监听本机。局域网访问必须使用上面的 `web --lan` 安全入口。
 
 ### 校验和表格
 
@@ -141,6 +181,10 @@ CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇
 ```powershell
 python -m pytest
 python -m compileall -q health_exporter ohealth_exporter.py
+cd .\webapp
+npm install
+npm test
+npm run build
 ```
 
-健康数据、截图、UI XML、数据库快照和导出文件都属于敏感个人信息，不要上传到公开仓库、网盘或 issue。
+生产前端会编译到 `health_exporter/web_dist/`，由同一个本地 Python 服务提供；运行时不需要单独启动 Node。健康数据、截图、UI XML、数据库快照和导出文件都属于敏感个人信息，不要上传到公开仓库、网盘或 issue。

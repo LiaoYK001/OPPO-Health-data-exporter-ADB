@@ -39,6 +39,7 @@ from .ui import UiCollector, local_id, node_label
 from .vendor.base import SnapshotFile, SnapshotResult
 from .vendor.oppo import OppoAdapter
 from .verification import Verifier
+from .webapp import serve_web
 
 
 def json_print(value: Any) -> None:
@@ -887,7 +888,7 @@ def _add_collect_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="OPPO 健康 Root 数据库 + ADB 页面证据导出器"
+        description="多品牌健康数据中枢（OPPO Root 数据库 + ADB 页面证据采集器）"
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--adb", help="adb.exe 路径")
@@ -953,6 +954,22 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--host", default="127.0.0.1")
     dashboard_parser.add_argument("--port", type=int, default=8765)
     dashboard_parser.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
+    web_parser = commands.add_parser(
+        "web", help="启动多品牌健康数据统一 Web 平台"
+    )
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", type=int, default=8765)
+    web_parser.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
+    web_parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="允许局域网访问；首次使用会要求设置登录密码",
+    )
+    web_parser.add_argument(
+        "--reset-password",
+        action="store_true",
+        help="在局域网模式下重新设置 Web 登录密码",
+    )
     return parser
 
 
@@ -972,6 +989,7 @@ def main() -> int:
         "repair-normalized": repair_normalized,
         "verify": verify_data,
         "dashboard": serve_dashboard,
+        "web": serve_web,
     }
     try:
         return handlers[args.command](args)

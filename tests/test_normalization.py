@@ -171,8 +171,9 @@ def test_sleep_stage_is_preserved_as_interval(tmp_path: Path) -> None:
     normalizer.finalize()
     interval = db.connection.execute("SELECT * FROM metric_intervals").fetchone()
     assert db.connection.execute("SELECT COUNT(*) FROM metric_intervals").fetchone()[0] == 1
-    assert interval["state"] == "2"
+    assert interval["state"] == "deep"
     assert interval["value_num"] == 3600
+    assert json.loads(interval["metadata_json"])["vendor_state"] == "2"
     db.close()
 
 

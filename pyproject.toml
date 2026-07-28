@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ohealth-data-exporter"
-version = "0.2.0"
-description = "Root database and ADB evidence exporter for OPPO Health"
+version = "0.3.0"
+description = "Local multi-vendor health archive, normalization, evidence export and web app"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.115,<1",
   "numpy>=2.0",
   "openpyxl>=3.1",
   "Pillow>=11.0",
+  "uvicorn>=0.32,<1",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +27,14 @@ ohealth-exporter = "health_exporter.cli:main"
 include = ["health_exporter*"]
 
 [tool.setuptools.package-data]
-health_exporter = ["web/*.html", "web/*.css", "web/*.js"]
+health_exporter = [
+  "web/*.html",
+  "web/*.css",
+  "web/*.js",
+  "web_dist/*.html",
+  "web_dist/*.png",
+  "web_dist/assets/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
