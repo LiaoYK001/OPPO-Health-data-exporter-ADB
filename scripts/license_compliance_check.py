@@ -19,6 +19,7 @@ PYTHON_LICENSE_MARKERS = {
     ),
     "openpyxl": ("mit",),
     "pillow": ("mit-cmu",),
+    "tzdata": ("apache-2.0", "apache software license"),
     "uvicorn": ("bsd-3-clause", "bsd license"),
 }
 OPTIONAL_PYTHON_LICENSE_MARKERS = {

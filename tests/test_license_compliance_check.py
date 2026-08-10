@@ -9,5 +9,9 @@ def test_license_matching_is_case_insensitive() -> None:
     assert _license_matches("License-Expression: MIT", ("mit",))
 
 
+def test_tzdata_accepts_apache_spdx_license_expression() -> None:
+    assert _license_matches("Apache-2.0", PYTHON_LICENSE_MARKERS["tzdata"])
+
+
 def test_unreviewed_license_is_rejected() -> None:
     assert not _license_matches("GPL-3.0-only", PYTHON_LICENSE_MARKERS["numpy"])

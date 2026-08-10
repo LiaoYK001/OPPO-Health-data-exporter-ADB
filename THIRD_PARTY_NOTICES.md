@@ -19,6 +19,6 @@ Apache ECharts includes software developed at the Apache Software Foundation. Th
 - [React license](third_party/React-MIT.txt)
 - [Lucide license](third_party/Lucide-ISC.txt)
 
-Python runtime dependencies are installed separately rather than copied into this repository. At the time of this notice the direct dependencies use: defusedxml (PSF License), FastAPI (MIT), NumPy (BSD-3-Clause), openpyxl (MIT), Pillow (MIT-CMU), Uvicorn (BSD-3-Clause), and optional Frida (wxWindows Library Licence 3.1). Their installed distributions contain the authoritative license texts. Dependency versions and licenses must be rechecked when updating lock files or publishing a binary bundle.
+Python runtime dependencies are installed separately rather than copied into this repository. At the time of this notice the direct dependencies use: defusedxml (PSF License), FastAPI (MIT), NumPy (BSD-3-Clause), openpyxl (MIT), Pillow (MIT-CMU), tzdata on Windows (Apache-2.0), Uvicorn (BSD-3-Clause), and optional Frida (wxWindows Library Licence 3.1). Their installed distributions contain the authoritative license texts. Dependency versions and licenses must be rechecked when updating lock files or publishing a binary bundle.
 
 This notice is informational and does not change any third-party license.
