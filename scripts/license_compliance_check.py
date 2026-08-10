@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHON_LICENSE_MARKERS = {
     "defusedxml": ("psfl", "python software foundation license"),
     "fastapi": ("mit",),
-    "numpy": ("bsd license", "redistribution and use in source and binary forms"),
+    "numpy": (
+        "bsd-3-clause",
+        "bsd license",
+        "redistribution and use in source and binary forms",
+    ),
     "openpyxl": ("mit",),
     "pillow": ("mit-cmu",),
     "uvicorn": ("bsd-3-clause", "bsd license"),
@@ -55,6 +59,10 @@ def _python_license_text(package: str) -> str:
     return "\n".join(fields).lower()
 
 
+def _license_matches(license_text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker.lower() in license_text.lower() for marker in markers)
+
+
 def _check_python(findings: list[str]) -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     declared = {
@@ -72,14 +80,14 @@ def _check_python(findings: list[str]) -> None:
         except PackageNotFoundError:
             findings.append(f"python-package-missing: {package}")
             continue
-        if not any(marker in license_text for marker in markers):
+        if not _license_matches(license_text, markers):
             findings.append(f"python-license-unexpected: {package}")
     for package, markers in OPTIONAL_PYTHON_LICENSE_MARKERS.items():
         try:
             license_text = _python_license_text(package)
         except PackageNotFoundError:
             continue
-        if not any(marker in license_text for marker in markers):
+        if not _license_matches(license_text, markers):
             findings.append(f"python-optional-license-unexpected: {package}")
 
 
