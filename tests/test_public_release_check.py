@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from scripts.public_release_check import _github_escape, _sensitive_path, _text_rules
+from scripts.public_release_check import (
+    _configure_utf8_output,
+    _github_escape,
+    _sensitive_path,
+    _text_rules,
+)
 
 
 def _rules():
@@ -36,3 +41,16 @@ def test_placeholders_do_not_trigger_identity_rules() -> None:
 
 def test_github_annotation_values_are_command_escaped() -> None:
     assert _github_escape("path%name\r\nnext") == "path%25name%0D%0Anext"
+
+
+def test_public_checker_configures_utf8_output_when_supported() -> None:
+    class Stream:
+        settings: dict[str, str] = {}
+
+        def reconfigure(self, **settings: str) -> None:
+            self.settings = settings
+
+    stream = Stream()
+    _configure_utf8_output([stream])  # type: ignore[list-item]
+
+    assert stream.settings == {"encoding": "utf-8", "errors": "replace"}

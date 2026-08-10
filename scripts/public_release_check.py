@@ -8,7 +8,7 @@ import shutil
 import subprocess  # nosec B404
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, TextIO
 
 from PIL import ExifTags, Image, UnidentifiedImageError
 
@@ -308,6 +308,13 @@ def _github_escape(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def _configure_utf8_output(streams: Iterable[TextIO] | None = None) -> None:
+    for stream in streams if streams is not None else (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def _print_findings(findings: Iterable[str]) -> int:
     unique = sorted(set(findings))
     if not unique:
@@ -325,6 +332,7 @@ def _print_findings(findings: Iterable[str]) -> int:
 
 
 def main() -> int:
+    _configure_utf8_output()
     parser = argparse.ArgumentParser(description="检查公开仓库中的敏感路径、PII 和凭据痕迹")
     parser.add_argument(
         "--history",

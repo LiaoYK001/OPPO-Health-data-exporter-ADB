@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: "1"
+
 jobs:
   current-tree-and-privacy:
     runs-on: ubuntu-latest
