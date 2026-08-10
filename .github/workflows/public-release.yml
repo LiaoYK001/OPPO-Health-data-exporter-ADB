@@ -2,12 +2,29 @@ name: Public release gate
 
 on:
   workflow_dispatch:
+    inputs:
+      include_history:
+        description: "同时执行可选的完整 Git 历史盘点"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
-  history-and-privacy:
+  current-tree-and-privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e .
+      - run: python scripts/public_release_check.py
+
+  optional-history-audit:
+    if: ${{ inputs.include_history }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,4 +33,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: python -m pip install -e .
       - run: python scripts/public_release_check.py --history

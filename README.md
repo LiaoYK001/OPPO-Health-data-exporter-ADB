@@ -201,7 +201,7 @@ CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇
 
 项目代码按 [MIT License](LICENSE) 发布；前端编译产物包含 Apache ECharts、React、zrender、Lucide 等第三方组件，归属和再分发条款见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
 
-当前公开发布门禁和已验证结果见 [AUDIT_REPORT.md](AUDIT_REPORT.md)；完整命令、发行包检查和 GitHub 设置见 [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md)。任何标为阻断的历史项解决前都不应把仓库设为 Public。
+当前公开发布门禁和已验证结果见 [AUDIT_REPORT.md](AUDIT_REPORT.md)；完整命令、发行包检查和 GitHub 设置见 [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md)。当前树和发行物已经通过；仓库所有者选择不重写旧 Git 历史，旧身份字段和旧用户目录属于已披露并接受的残余风险。
 
 ## 开发验证
 
@@ -220,4 +220,4 @@ npm audit --omit=dev --audit-level=moderate
 npm run build
 ```
 
-生产前端会编译到 `health_exporter/web_dist/`，由同一个本地 Python 服务提供；运行时不需要单独启动 Node。首次公开发布或改写历史后还要运行 `python .\scripts\public_release_check.py --history`；该检查也会拒绝未审核的历史作者/提交者名称和非 GitHub noreply 邮箱。
+生产前端会编译到 `health_exporter/web_dist/`，由同一个本地 Python 服务提供；运行时不需要单独启动 Node。需要完整历史审计时可额外运行 `python .\scripts\public_release_check.py --history`；该检查会报告未审核的历史作者/提交者名称、非 GitHub noreply 邮箱和旧用户目录，不影响默认的当前树门禁。

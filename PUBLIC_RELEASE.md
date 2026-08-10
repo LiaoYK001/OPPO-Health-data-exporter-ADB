@@ -1,6 +1,6 @@
 # 公开发布门禁
 
-公开仓库发布不是简单把 `data/` 加入 `.gitignore`。发布者必须证明当前树和全部历史都不含健康数据、凭据、真实用户目录或不必要的身份信息。
+公开仓库发布不是简单把 `data/` 加入 `.gitignore`。默认门禁必须证明当前树、待提交文件和发行物不含健康数据、凭据、真实用户目录或不必要的身份信息。完整 Git 历史扫描保留为可选的加强审计；如果选择不重写历史，必须像 [AUDIT_REPORT.md](AUDIT_REPORT.md) 一样明确记录并接受残余风险。
 
 ## 每次发布
 
@@ -10,7 +10,6 @@ python -m ruff check health_exporter tests scripts ohealth_exporter.py
 python -m bandit -q -r health_exporter scripts ohealth_exporter.py -l
 python -m pip_audit . --progress-spinner off
 python .\scripts\public_release_check.py
-python .\scripts\public_release_check.py --history
 python .\scripts\license_compliance_check.py
 python -m build
 python .\scripts\package_contents_check.py .\dist
@@ -32,7 +31,7 @@ git diff --exit-code -- ..\health_exporter\web_dist
 
 ## GitHub 仓库设置
 
-历史门禁通过后、切换为 Public 前，应在仓库设置中：
+当前树和发行物门禁通过后、切换为 Public 前，应在仓库设置中：
 
 - 启用 Private vulnerability reporting、Dependabot alerts、secret scanning 和 push protection（账户方案支持时）；
 - 为 `main` 设置分支保护或规则集，要求 CI 和 CodeQL 通过后才能合并；
@@ -41,9 +40,9 @@ git diff --exit-code -- ..\health_exporter\web_dist
 - 检查仓库 About、社交预览图和 Release 附件，不上传本地数据库、导出表或调试压缩包；
 - 验证 `SECURITY.md` 的私下报告链接实际可用。
 
-## Git 历史去敏
+## 可选：Git 历史审计与去敏
 
-`public_release_check.py --history` 会检查敏感路径、用户主目录痕迹、提交消息、未审核的作者/提交者显示名和非 GitHub noreply 的作者/提交者邮箱。任一失败都应阻止公开发布。
+`python scripts/public_release_check.py --history` 会检查敏感路径、用户主目录痕迹、提交消息、未审核的作者/提交者显示名和非 GitHub noreply 的作者/提交者邮箱。它是比默认当前树门禁更严格的历史盘点；如果不整改其发现，公开前应在审计报告中逐项披露残余风险。
 
 历史去敏会改变提交 SHA，影响所有克隆、分支和标签。执行前应制作私有镜像备份并通知协作者；可选择：
 
