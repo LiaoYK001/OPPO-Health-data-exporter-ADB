@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 # Fixed argv only; shell execution is never used.
@@ -83,10 +84,13 @@ def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _publishable_files() -> list[str]:
+def _publishable_files(*, tracked_only: bool = False) -> list[str]:
     # Trusted Git path and fixed argv.
+    arguments = [GIT_EXECUTABLE, "ls-files", "-z", "--cached"]
+    if not tracked_only:
+        arguments.extend(["--others", "--exclude-standard"])
     result = subprocess.run(  # nosec B603
-        [GIT_EXECUTABLE, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        arguments,
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -154,9 +158,9 @@ def _image_metadata(path: Path) -> str:
     return "\n".join(values)
 
 
-def _scan_current(findings: list[str]) -> None:
+def _scan_current(findings: list[str], *, tracked_only: bool = False) -> None:
     rules = _text_rules()
-    for relative in _publishable_files():
+    for relative in _publishable_files(tracked_only=tracked_only):
         if _sensitive_path(relative):
             findings.append(f"publishable-sensitive-path: {relative}")
         path = ROOT / relative
@@ -300,6 +304,10 @@ def _history_text(findings: list[str]) -> None:
                     reported.add(key)
 
 
+def _github_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def _print_findings(findings: Iterable[str]) -> int:
     unique = sorted(set(findings))
     if not unique:
@@ -308,6 +316,11 @@ def _print_findings(findings: Iterable[str]) -> int:
     print("公开发布检查失败；仅列出规则和文件，不输出疑似秘密内容：", file=sys.stderr)
     for finding in unique:
         print(f"- {finding}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            print(
+                f"::error title=Public release check::{_github_escape(finding)}",
+                file=sys.stderr,
+            )
     return 1
 
 
@@ -318,9 +331,14 @@ def main() -> int:
         action="store_true",
         help="同时检查所有 Git 历史路径、作者邮箱和高风险文本",
     )
+    parser.add_argument(
+        "--tracked-only",
+        action="store_true",
+        help="只检查 Git 已跟踪文件；用于干净 checkout 中的 CI",
+    )
     args = parser.parse_args()
     findings: list[str] = []
-    _scan_current(findings)
+    _scan_current(findings, tracked_only=args.tracked_only)
     if args.history:
         _history_paths(findings)
         _history_authors(findings)

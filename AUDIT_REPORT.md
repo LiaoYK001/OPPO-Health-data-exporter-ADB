@@ -25,7 +25,7 @@
 - Web 保持 SQLite 只读和素材登记/目录校验，新增本机/私网 Host 校验以降低 DNS rebinding 风险，并增加 CSP、禁止 framing、浏览器权限限制、跨源资源策略、登录请求大小限制、失败限速和兼容旧配置的加强版 scrypt 参数。
 - 在支持 POSIX 权限的系统上将数据/私有目录、SQLite、盐、Web 登录配置和 Frida 工具收紧为仅当前用户访问；Windows 仍应依赖 NTFS ACL 和磁盘加密。
 - 修复 Node 开发依赖 `nanoid` 的高危公告版本（3.3.16 → 3.3.18）。
-- 补齐隐私、安全披露、行为规范、贡献要求、商标/非隶属声明、医疗免责声明、第三方 notices、issue/PR 隐私模板、CI、CodeQL、Dependabot 和手动公开发布门禁。
+- 补齐隐私、安全披露、行为规范、贡献要求、商标/非隶属声明、医疗免责声明、第三方 notices、issue/PR 隐私模板、CI、CodeQL、Dependabot 和手动公开发布门禁。GitHub Actions 已升级到 Node 24 兼容的 v7，CodeQL 升级到 v4 并仅增加其读取 Actions 运行元数据所需的权限。
 - 增加自动许可门禁，依赖集合或许可证变化时要求同步审核和更新 notices；新增位图默认被拒绝，只有显式审核白名单中的 OG 图片可以进入公开发行物，且其文本/EXIF 元数据会被扫描。
 - Python wheel/sdist 携带 MIT 和第三方许可；`MANIFEST.in` 明确排除数据、凭据和导出格式。新增发行包内容门禁，构建后逐项拒绝路径穿越、私有目录、数据库/密钥类文件和缺失许可证。
 
@@ -33,10 +33,10 @@
 
 本次审计结果：
 
-- Python：94 个测试通过；Ruff 通过；compileall 通过。
+- Python：95 个测试通过；Ruff 通过；compileall 通过。
 - Bandit：所有严重等级均无未解释发现。Web 查询已经拆成完全静态、参数绑定的 SQL 分支；仅有两处 OPPO 原始库表名来自 `sqlite_master`，SQLite 无法绑定标识符，因此在双引号转义后使用最小范围的 `B608` 抑制；所有数据值继续参数绑定。
 - `pip-audit`：项目运行时依赖无已知漏洞。
-- 前端：6 个 Vitest 测试通过；`npm audit` 为 0；Vite 生产构建通过。
+- 前端：Lucide 1.x、jest-dom 7 和 React 类型补丁升级后，6 个 Vitest 测试通过，`npm audit` 为 0，Vite 生产构建通过；`@types/node` 保持 24.x，与 CI 的 Node 24 运行时一致。
 - `detect-secrets`：当前被跟踪和待提交文件 0 个发现；带 Git 补丁上下文的全历史扫描仅命中测试登录成功/失败和限流所需的 4 个固定假密码，没有真实凭据发现。
 - 第三方许可门禁：Python/Node 运行时依赖许可证和所有必需 notice 文件一致。
 - 自定义当前树门禁：通过；非阻断历史盘点仍列出上文的作者/提交者名称、作者/提交者邮箱和旧用户目录。

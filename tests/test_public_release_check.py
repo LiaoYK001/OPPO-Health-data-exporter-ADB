@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.public_release_check import _sensitive_path, _text_rules
+from scripts.public_release_check import _github_escape, _sensitive_path, _text_rules
 
 
 def _rules():
@@ -32,3 +32,7 @@ def test_placeholders_do_not_trigger_identity_rules() -> None:
 
     assert not rules["windows-user-home"].search("C:\\path\\to\\project")
     assert not rules["email-address"].search("GitHub noreply address")
+
+
+def test_github_annotation_values_are_command_escaped() -> None:
+    assert _github_escape("path%name\r\nnext") == "path%25name%0D%0Anext"

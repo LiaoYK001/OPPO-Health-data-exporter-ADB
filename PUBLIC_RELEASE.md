@@ -35,7 +35,7 @@ git diff --exit-code -- ..\health_exporter\web_dist
 
 - 启用 Private vulnerability reporting、Dependabot alerts、secret scanning 和 push protection（账户方案支持时）；
 - 为 `main` 设置分支保护或规则集，要求 CI 和 CodeQL 通过后才能合并；
-- 将 Actions 默认 `GITHUB_TOKEN` 权限设为只读，仅让 CodeQL 作业拥有 `security-events: write`；
+- 将 Actions 默认 `GITHUB_TOKEN` 权限设为只读，仅让 CodeQL 作业拥有 `actions: read` 和 `security-events: write`；
 - 禁止 Actions 创建或批准 PR，除非以后有经过单独威胁审查的明确需求；
 - 检查仓库 About、社交预览图和 Release 附件，不上传本地数据库、导出表或调试压缩包；
 - 验证 `SECURITY.md` 的私下报告链接实际可用。
