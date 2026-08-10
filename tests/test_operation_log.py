@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import datetime as dt
 import json
 from pathlib import Path
 
@@ -24,7 +25,9 @@ def test_operation_logger_writes_structured_timestamped_event(tmp_path: Path) ->
     )
 
     event = json.loads(path.read_text(encoding="utf-8"))
-    assert event["timestamp"].endswith(("+08:00", "Z"))
+    timestamp = dt.datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset() is not None
     assert event["epoch_ms"] > 0
     assert event["level"] == "WARNING"
     assert event["run_id"] == "run-123"
