@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 import uuid
@@ -321,7 +322,10 @@ class Database:
         self.private_dir = private_dir
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.private_dir.mkdir(parents=True, exist_ok=True)
+        self._restrict_permissions(self.path.parent, 0o700)
+        self._restrict_permissions(self.private_dir, 0o700)
         self.connection = sqlite3.connect(self.path)
+        self._restrict_permissions(self.path, 0o600)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
@@ -337,6 +341,14 @@ class Database:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    @staticmethod
+    def _restrict_permissions(path: Path, mode: int) -> None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            # Windows ACLs and some network filesystems do not implement POSIX modes.
+            pass
 
     def _migrate(self) -> None:
         current = self.connection.execute("PRAGMA user_version").fetchone()[0]
@@ -496,9 +508,11 @@ class Database:
             value = salt_path.read_bytes()
             if len(value) < 32:
                 raise ExporterError(f"脱敏盐文件损坏：{salt_path}")
+            self._restrict_permissions(salt_path, 0o600)
             return value
         value = secrets.token_bytes(32)
         salt_path.write_bytes(value)
+        self._restrict_permissions(salt_path, 0o600)
         return value
 
     def pseudonymize(self, value: str | None) -> str:
@@ -1284,11 +1298,14 @@ class Database:
             clauses.append("stage=?")
             parameters.append(stage)
         parameters.extend([utc_now(), resolution])
+        where_sql = " AND ".join(clauses)
+        # All clauses are fixed strings selected above; values remain parameters.
+        query = (
+            "UPDATE failures SET resolved_at=?, resolution=? WHERE "  # nosec B608
+            + where_sql
+        )
         cursor = self.connection.execute(
-            f"""
-            UPDATE failures SET resolved_at=?, resolution=?
-            WHERE {' AND '.join(clauses)}
-            """,
+            query,
             (*parameters[-2:], *parameters[:-2]),
         )
         self.connection.commit()

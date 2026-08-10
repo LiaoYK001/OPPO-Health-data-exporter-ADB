@@ -3,8 +3,10 @@
 本项目是本地优先的多品牌健康与运动数据归一化平台。当前 OPPO 适配器采用两条采集通道：Root 阶段保存 OPPO 健康的数据库、WAL/SHM 和完整原始行；非 Root 阶段通过 ADB 遍历“健康”页及指标详情，保存逐屏 PNG、UI XML、长图、图表裁剪和页面文字。所有厂商数据写入同一套 SQLite 规范层，并可通过响应式 Web、CSV 和 XLSX 持续查看。未来接入小米健康或华为健康时，已有历史不需要搬迁或覆盖。
 
 > OPPO 健康 6.5.4 会检测 Root 并主动退出。不要长期保持 Root，也不要安装 Root 隐藏模块。采集必须分成两个阶段。
+>
+> **隐私警告：** `data/`、`.diagnostics/`、`output/`、运行日志、截图和导出表格均可能包含健康信息或账号/设备标识。它们已被 Git 忽略，但提交前仍必须运行 `python .\scripts\public_release_check.py`。不要把真实数据附在 issue、PR 或公开网盘中。
 
-## 当前环境
+## 已验收环境
 
 - MuMu：Android 15（SDK 35；同时兼容旧的 Android 12 ADB 路径）
 - MuMu ADB：`127.0.0.1:7555`
@@ -13,6 +15,19 @@
 - 显示基准：`1440×2560`、密度 `640`、中文、深色模式
 - 本地数据库：`data/health.sqlite3`
 - 原始快照和页面素材：`data/`（已从 Git 排除）
+
+## 安装
+
+项目目前以 Windows + MuMu 为主要验收环境。建议使用独立虚拟环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+只有数据库解密流程需要可选 Frida 依赖：`python -m pip install -e ".[frida]"`。开发和安全审计工具可用 `python -m pip install -e ".[dev]"` 安装。
 
 ## 两阶段操作
 
@@ -52,7 +67,7 @@ python .\ohealth_exporter.py collect --ui-only --all-history --resume
 电脑需要正常重启、关机或安装系统更新时，不要直接在任务管理器中结束 Python，也不要先关闭 MuMu。先在项目目录执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collection.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collection.ps1
 ```
 
 暂停脚本会依次执行以下操作：
@@ -82,7 +97,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pause_ui_collectio
 5. 在项目目录执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collection.ps1
 ```
 
 恢复脚本会先检查 ADB 连接、显示配置、APP 版本、前台 APP、剩余磁盘空间及 Root 是否关闭。检查全部通过后，它才会删除 `STOP_UI_COLLECTION` 并修复重启前遗留的运行状态。若心率 checkpoint 已等于心率最早来源日期，脚本会跳过重复心率采集，直接衔接活动、睡眠、血氧、血压、体重和压力；否则先从心率 checkpoint 继续。
@@ -100,7 +115,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 Web 应用只读取本机 SQLite 和内容寻址素材，不会修改健康数据、控制模拟器或把数据发送到外网。默认仅供这台电脑访问：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1
 ```
 
 也可直接运行：
@@ -124,7 +139,7 @@ python .\ohealth_exporter.py web --open
 只有需要同一局域网内的手机或平板访问时才开启 `-Lan`：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB" -Lan
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Lan
 ```
 
 首次启动会在终端要求设置至少 8 位的访问密码。密码使用随机盐和 `scrypt` 保存为本地哈希，浏览器登录后使用 HttpOnly 会话 Cookie；服务重启后需重新登录。手机访问地址为 `http://<这台电脑的局域网IP>:8765/`。只应在可信家庭局域网使用，不要进行公网端口映射或隧道转发。
@@ -132,7 +147,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Wor
 需要重新设置密码时：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB" -Lan -ResetPassword
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Lan -ResetPassword
 ```
 
 ### 本地可视化监控与调试日志
@@ -140,7 +155,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_web.ps1 -Wor
 原有监控命令继续兼容，并会直接进入新 Web 的“采集管理”页面：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1
 ```
 
 浏览器会打开 `http://127.0.0.1:8765/admin/collector`。页面每秒刷新，展示 ADB/Root/APP/采集进程状态、各指标 checkpoint、未解决失败、素材数量和容量、实时事件流以及可选择的完整日志尾部。中文 Windows PowerShell 日志会自动识别 UTF-8、UTF-16 或 GB18030 编码。
@@ -176,15 +191,33 @@ CSV 和多 Sheet XLSX 位于 `data/exports/<时间>/`。表格只保留日级汇
 
 完整状态、故障处理和验收边界见 [MuMu 操作流程](document/MUMU_WORKFLOW.md)。
 
+## 隐私、安全与责任边界
+
+- 本项目默认仅在本机处理数据，不集成遥测、广告、第三方统计或 CDN。依赖安装和可选 Frida Server 下载会访问软件包仓库或 Frida 官方 GitHub Release；健康数据不会因此上传。完整的数据分类、保留和删除建议见 [PRIVACY.md](PRIVACY.md)。
+- Web 默认只监听 `127.0.0.1`，并校验本机/私网 Host 以降低 DNS rebinding 风险。`--lan` 使用密码和 HttpOnly Cookie，但仍是明文 HTTP，只适合可信家庭局域网；不要直接暴露到公网。漏洞请按 [SECURITY.md](SECURITY.md) 私下报告，切勿附带真实数据库、日志、截图、密钥或盐值。
+- Root、ADB 和 Frida 只应在你拥有或获明确授权的设备、账号和数据上使用。你需要自行确认当地法律、应用条款、设备保修和组织政策；本项目不提供绕过账号授权、Root 检测或访问他人数据的功能。
+- 本项目不是医疗器械，展示结果不能替代医生诊断或紧急医疗服务。导出前后都应保留厂商原始数据，并校验备份可恢复性。
+- OPPO、OPlus、HeyTap、MuMu、小米和华为等名称及商标归各自权利人所有。本项目是独立的社区项目，与这些厂商不存在隶属、授权或背书关系。
+
+项目代码按 [MIT License](LICENSE) 发布；前端编译产物包含 Apache ECharts、React、zrender、Lucide 等第三方组件，归属和再分发条款见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+
+当前公开发布门禁和已验证结果见 [AUDIT_REPORT.md](AUDIT_REPORT.md)；完整命令、发行包检查和 GitHub 设置见 [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md)。任何标为阻断的历史项解决前都不应把仓库设为 Public。
+
 ## 开发验证
 
 ```powershell
 python -m pytest
 python -m compileall -q health_exporter ohealth_exporter.py
+python -m ruff check health_exporter tests scripts ohealth_exporter.py
+python -m bandit -r health_exporter ohealth_exporter.py -x health_exporter/web_dist -ll
+python -m pip_audit . --progress-spinner off
+python .\scripts\public_release_check.py
+python .\scripts\license_compliance_check.py
 cd .\webapp
-npm install
+npm ci
 npm test
+npm audit --omit=dev --audit-level=moderate
 npm run build
 ```
 
-生产前端会编译到 `health_exporter/web_dist/`，由同一个本地 Python 服务提供；运行时不需要单独启动 Node。健康数据、截图、UI XML、数据库快照和导出文件都属于敏感个人信息，不要上传到公开仓库、网盘或 issue。
+生产前端会编译到 `health_exporter/web_dist/`，由同一个本地 Python 服务提供；运行时不需要单独启动 Node。首次公开发布或改写历史后还要运行 `python .\scripts\public_release_check.py --history`；该检查也会拒绝未审核的历史作者/提交者名称和非 GitHub noreply 邮箱。

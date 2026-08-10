@@ -4,20 +4,21 @@ import argparse
 import hashlib
 import json
 import mimetypes
-import os
+import shutil
 import sqlite3
-import subprocess
+# Process inspection uses a fixed PowerShell executable and fixed script body.
+import subprocess  # nosec B404
 import threading
 import time
-import webbrowser
-import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from defusedxml import ElementTree as ET
 
 from .adb import AdbClient, find_adb
 from .constants import DEFAULT_SERIAL, PACKAGE
@@ -358,6 +359,9 @@ class DashboardState:
             except Exception as exc:
                 value["errors"].append(f"ADB: {exc}")
             try:
+                powershell = shutil.which("powershell.exe")
+                if powershell is None:
+                    raise FileNotFoundError("powershell.exe")
                 script = r"""
 $items = Get-CimInstance Win32_Process | Where-Object {
   $_.ProcessId -ne $PID -and $_.CommandLine -and (
@@ -368,8 +372,8 @@ $items = Get-CimInstance Win32_Process | Where-Object {
 @($items) | ConvertTo-Json -Compress
 """
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                completed = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-Command", script],
+                completed = subprocess.run(  # nosec B603
+                    [powershell, "-NoProfile", "-Command", script],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",

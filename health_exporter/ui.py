@@ -7,11 +7,11 @@ import math
 import re
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+from defusedxml import ElementTree as ET
 from PIL import Image
 
 from .adb import AdbClient
@@ -2140,7 +2140,8 @@ class UiCollector:
                                     action="back",
                                     status="complete",
                                 )
-                        except Exception:
+                        # Recovery is opportunistic; the original page failure is retained.
+                        except Exception:  # nosec B110
                             pass
         return None
 

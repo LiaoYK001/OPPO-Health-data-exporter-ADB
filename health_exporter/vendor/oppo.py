@@ -3,13 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import os
 import re
-import shutil
 import sqlite3
 import tempfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..adb import AdbClient
@@ -25,8 +23,15 @@ APP_DATA_ROOT = f"/data/user/0/{PACKAGE}"
 
 
 def _safe_relative(remote: str) -> Path:
-    relative = remote.removeprefix(APP_DATA_ROOT).lstrip("/")
-    parts = [re.sub(r"[^A-Za-z0-9._-]+", "_", part) for part in Path(relative).parts]
+    prefix = f"{APP_DATA_ROOT}/"
+    if not remote.startswith(prefix):
+        raise ExporterError("设备数据库路径不在 OPPO 健康数据目录内。")
+    raw_parts = PurePosixPath(remote.removeprefix(prefix)).parts
+    if not raw_parts or any(part in {"", ".", ".."} for part in raw_parts):
+        raise ExporterError("设备数据库路径包含无效的相对路径段。")
+    parts = [re.sub(r"[^A-Za-z0-9._-]+", "_", part) for part in raw_parts]
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ExporterError("设备数据库路径无法安全映射到本地。")
     return Path(*parts)
 
 
@@ -176,9 +181,11 @@ class OppoAdapter(VendorAdapter):
                 for table in tables:
                     if table.lower() in TABLE_METRICS:
                         quoted = table.replace('"', '""')
-                        row_count += int(
-                            connection.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0]
+                        # SQLite identifiers cannot be bound; escape the sqlite_master name.
+                        query = (
+                            'SELECT COUNT(*) FROM "' + quoted + '"'  # nosec B608
                         )
+                        row_count += int(connection.execute(query).fetchone()[0])
                 return "sqlite", tables, schema_hash, row_count
         except sqlite3.Error:
             return "sqlite_unreadable", [], None, None
@@ -206,7 +213,11 @@ class OppoAdapter(VendorAdapter):
                 for table in sorted(selected):
                     primary_keys = self._primary_keys(connection, table)
                     quoted = table.replace('"', '""')
-                    cursor = connection.execute(f'SELECT * FROM "{quoted}"')
+                    # The name comes from sqlite_master and embedded quotes are escaped.
+                    query = (
+                        'SELECT * FROM "' + quoted + '"'  # nosec B608
+                    )
+                    cursor = connection.execute(query)
                     count = 0
                     while True:
                         rows = cursor.fetchmany(500)

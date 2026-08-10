@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import shutil
-import subprocess
+# Used only for catching TimeoutExpired from list-based child process calls.
+import subprocess  # nosec B404
 import sys
 import tempfile
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 

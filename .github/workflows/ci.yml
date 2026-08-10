@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python .\scripts\public_release_check.py
+      - run: python .\scripts\license_compliance_check.py
+      - run: python -m ruff check health_exporter tests scripts ohealth_exporter.py
+      - run: python -m bandit -q -r health_exporter scripts ohealth_exporter.py -l
+      - run: python -m pytest
+      - run: python -m pip_audit . --progress-spinner off
+      - run: python -m build
+      - run: python .\scripts\package_contents_check.py .\dist
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm audit --audit-level=high
+      - run: npm run build
+      - name: Verify compiled frontend is committed
+        working-directory: .
+        run: git diff --exit-code -- health_exporter/web_dist

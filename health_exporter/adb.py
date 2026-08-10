@@ -4,7 +4,8 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
+# ADB is intentionally invoked as an argument list with shell=False.
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,7 +51,7 @@ class AdbClient:
         }
         if not binary:
             kwargs.update(text=True, encoding="utf-8", errors="replace")
-        result = subprocess.run(command, **kwargs)
+        result = subprocess.run(command, **kwargs)  # nosec B603
         if check and result.returncode != 0:
             stdout = result.stdout.decode(errors="replace") if binary else result.stdout
             stderr = result.stderr.decode(errors="replace") if binary else result.stderr

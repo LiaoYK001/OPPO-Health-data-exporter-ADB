@@ -1,0 +1,18 @@
+include LICENSE
+include README.md
+include PRIVACY.md
+include SECURITY.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include PUBLIC_RELEASE.md
+include THIRD_PARTY_NOTICES.md
+include AUDIT_REPORT.md
+recursive-include document *.md
+recursive-include third_party *.txt
+
+prune data
+prune output
+prune .diagnostics
+exclude document/chat-gemini-before.md
+global-exclude *.sqlite *.sqlite3 *.db *.db-wal *.db-shm *.csv *.xlsx *.jsonl
+global-exclude *.passphrase *.pem *.key id_salt.bin web-auth.json

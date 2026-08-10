@@ -4,7 +4,6 @@ import csv
 import datetime as dt
 import json
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -141,21 +140,26 @@ class DailyExporter:
         self.data_dir = data_dir
 
     def build_tables(self, source_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
-        parameters: tuple[Any, ...] = ()
-        where = ""
-        if source_id is not None:
-            where = "WHERE source_id=?"
-            parameters = (source_id,)
-        rows = self.db.connection.execute(
-            f"""
-            SELECT source_id, canonical_metric, local_date, revision,
-                   summary_json, fidelity, is_partial, created_at
-            FROM daily_metrics_current
-            {where}
-            ORDER BY source_id, local_date, canonical_metric
-            """,
-            parameters,
-        ).fetchall()
+        if source_id is None:
+            rows = self.db.connection.execute(
+                """
+                SELECT source_id, canonical_metric, local_date, revision,
+                       summary_json, fidelity, is_partial, created_at
+                FROM daily_metrics_current
+                ORDER BY source_id, local_date, canonical_metric
+                """
+            ).fetchall()
+        else:
+            rows = self.db.connection.execute(
+                """
+                SELECT source_id, canonical_metric, local_date, revision,
+                       summary_json, fidelity, is_partial, created_at
+                FROM daily_metrics_current
+                WHERE source_id=?
+                ORDER BY source_id, local_date, canonical_metric
+                """,
+                (source_id,),
+            ).fetchall()
         metric_tables: dict[str, list[dict[str, Any]]] = {
             f"{metric}_daily": [] for metric in PRIMARY_METRICS
         }
@@ -186,23 +190,27 @@ class DailyExporter:
             for key, value in flattened.items():
                 if key.startswith("computed_from_samples.") or "." not in key:
                     overview[f"{metric}.{key}"] = value
-        coverage_where = "WHERE source_id=?" if source_id is not None else ""
-        coverage_parameters: tuple[Any, ...] = (
-            (source_id,) if source_id is not None else ()
-        )
-        coverage = [
-            dict(row)
-            for row in self.db.connection.execute(
-                f"""
+        if source_id is None:
+            coverage_rows = self.db.connection.execute(
+                """
                 SELECT source_id, canonical_metric, local_date, status,
                        detail_json, updated_at
                 FROM coverage
-                {coverage_where}
+                ORDER BY source_id, local_date, canonical_metric
+                """
+            )
+        else:
+            coverage_rows = self.db.connection.execute(
+                """
+                SELECT source_id, canonical_metric, local_date, status,
+                       detail_json, updated_at
+                FROM coverage
+                WHERE source_id=?
                 ORDER BY source_id, local_date, canonical_metric
                 """,
-                coverage_parameters,
+                (source_id,),
             )
-        ]
+        coverage = [dict(row) for row in coverage_rows]
         return {
             "daily_overview": sorted(
                 overview_by_day.values(), key=lambda item: (item["source_id"], item["date"])

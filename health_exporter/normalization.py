@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -231,22 +230,22 @@ def _select_activity_stat(
         return newest(payloads), "single_or_untyped_row"
 
     combined = dict(mode_rows[0])
-    for field in ACTIVITY_SUM_FIELDS:
-        values = [as_number(row.get(field)) for row in mode_rows]
+    for field_name in ACTIVITY_SUM_FIELDS:
+        values = [as_number(row.get(field_name)) for row in mode_rows]
         numeric = [value for value in values if value is not None]
         if numeric:
-            combined[field] = sum(numeric)
-    for field in (
+            combined[field_name] = sum(numeric)
+    for field_name in (
         "current_day_steps_goal",
         "current_day_calories_goal",
         "current_day_workout_goal",
         "current_day_move_about_times_goal",
         "total_static_cal",
     ):
-        values = [as_number(row.get(field)) for row in mode_rows]
+        values = [as_number(row.get(field_name)) for row in mode_rows]
         numeric = [value for value in values if value is not None]
         if numeric:
-            combined[field] = max(numeric)
+            combined[field_name] = max(numeric)
     combined["sport_mode"] = "aggregated_visible_modes"
     return combined, "sum_nonnegative_modes"
 
@@ -959,7 +958,7 @@ def repair_activity_normalization(
             corrected_summary = _activity_summary(activity_payloads)
             if not corrected_summary:
                 continue
-            for field in (
+            for field_name in (
                 "steps",
                 "distance_m",
                 "active_energy_kcal",
@@ -976,8 +975,8 @@ def repair_activity_normalization(
                 "sedentary_count",
                 "static_energy_kcal",
             ):
-                summary.pop(field, None)
-                summary.pop(f"{field}__unit", None)
+                summary.pop(field_name, None)
+                summary.pop(f"{field_name}__unit", None)
             summary.update(corrected_summary)
 
             rows = db.connection.execute(

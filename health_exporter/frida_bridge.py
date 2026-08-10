@@ -4,11 +4,13 @@ import hashlib
 import json
 import lzma
 import os
+import re
 import threading
 import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .adb import AdbClient
 from .constants import PACKAGE
@@ -21,6 +23,71 @@ ABI_NAMES = {
     "x86_64": "x86_64",
     "x86": "x86",
 }
+FRIDA_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*$")
+GITHUB_DOWNLOAD_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+MAX_RELEASE_METADATA_BYTES = 8 * 1024 * 1024
+MAX_SERVER_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_SERVER_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+
+
+def _validate_github_url(url: str, *, asset: bool = False) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        raise ExporterError("Frida 下载地址必须是无凭据的 HTTPS URL。")
+    host = (parsed.hostname or "").lower()
+    if host not in GITHUB_DOWNLOAD_HOSTS:
+        raise ExporterError(f"拒绝访问非 GitHub 下载主机：{host or 'unknown'}")
+    if asset and host == "github.com" and not parsed.path.startswith(
+        "/frida/frida/releases/download/"
+    ):
+        raise ExporterError("Frida 资源地址不属于 frida/frida 官方 Release。")
+
+
+def _open_github_url(
+    request: str | urllib.request.Request,
+    *,
+    timeout: int,
+    asset: bool = False,
+) -> Any:
+    initial_url = request.full_url if isinstance(request, urllib.request.Request) else request
+    _validate_github_url(initial_url, asset=asset)
+    response = urllib.request.urlopen(request, timeout=timeout)  # nosec B310
+    try:
+        _validate_github_url(response.geturl())
+    except Exception:
+        response.close()
+        raise
+    return response
+
+
+def _read_limited(response: Any, maximum: int, label: str) -> bytes:
+    length = response.headers.get("Content-Length")
+    if length:
+        try:
+            if int(length) > maximum:
+                raise ExporterError(f"{label} 超过允许的 {maximum} 字节。")
+        except ValueError as exc:
+            raise ExporterError(f"{label} 返回了无效的 Content-Length。") from exc
+    payload = response.read(maximum + 1)
+    if len(payload) > maximum:
+        raise ExporterError(f"{label} 超过允许的 {maximum} 字节。")
+    return payload
+
+
+def _decompress_limited(payload: bytes, maximum: int) -> bytes:
+    decompressor = lzma.LZMADecompressor()
+    try:
+        result = decompressor.decompress(payload, max_length=maximum + 1)
+    except lzma.LZMAError as exc:
+        raise ExporterError("Frida Server 压缩包不是有效的 XZ 数据。") from exc
+    if len(result) > maximum or not decompressor.eof:
+        raise ExporterError(f"Frida Server 解压后超过允许的 {maximum} 字节。")
+    return result
 
 
 def _frida_module() -> Any:
@@ -37,6 +104,8 @@ def prepare_server(adb: AdbClient, private_dir: Path) -> tuple[Path, str]:
     """Download the server matching the installed client and verify GitHub's SHA-256."""
     frida = _frida_module()
     version = str(frida.__version__)
+    if not FRIDA_VERSION_PATTERN.fullmatch(version):
+        raise ExporterError(f"Frida 客户端版本格式无效：{version!r}")
     android_abi = adb.shell("getprop", "ro.product.cpu.abi")
     abi = ABI_NAMES.get(android_abi)
     if abi is None:
@@ -48,29 +117,52 @@ def prepare_server(adb: AdbClient, private_dir: Path) -> tuple[Path, str]:
     server = tools_dir / asset_name.removesuffix(".xz")
     server_digest_path = server.with_suffix(server.suffix + ".sha256")
     if server.exists():
-        if server_digest_path.exists():
-            expected_server = server_digest_path.read_text(encoding="ascii").strip()
-            actual_server = hashlib.sha256(server.read_bytes()).hexdigest()
-            if actual_server != expected_server:
-                raise ExporterError("本地 Frida Server 哈希不匹配，拒绝继续使用。")
+        if not server_digest_path.exists():
+            raise ExporterError("本地 Frida Server 缺少 SHA-256 校验文件，拒绝继续使用。")
+        expected_server = server_digest_path.read_text(encoding="ascii").strip()
+        actual_server = hashlib.sha256(server.read_bytes()).hexdigest()
+        if actual_server != expected_server:
+            raise ExporterError("本地 Frida Server 哈希不匹配，拒绝继续使用。")
+        for path in (tools_dir, server, server_digest_path):
+            try:
+                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            except OSError:
+                pass
         return server, version
     release_url = f"https://api.github.com/repos/frida/frida/releases/tags/{version}"
     request = urllib.request.Request(release_url, headers={"User-Agent": "ohealth-exporter"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            release = json.load(response)
+        with _open_github_url(request, timeout=30) as response:
+            release = json.loads(
+                _read_limited(
+                    response, MAX_RELEASE_METADATA_BYTES, "Frida Release 元数据"
+                )
+            )
     except Exception as exc:
         raise ExporterError(f"无法读取 Frida 官方发布信息：{exc}") from exc
-    asset = next((item for item in release.get("assets", []) if item["name"] == asset_name), None)
+    if not isinstance(release, dict) or not isinstance(release.get("assets"), list):
+        raise ExporterError("Frida Release 元数据格式无效。")
+    asset = next(
+        (
+            item
+            for item in release["assets"]
+            if isinstance(item, dict) and item.get("name") == asset_name
+        ),
+        None,
+    )
     if asset is None:
         raise ExporterError(f"Frida 发布 {version} 中没有 {asset_name}")
     digest = str(asset.get("digest") or "")
-    if not digest.startswith("sha256:"):
+    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
         raise ExporterError("Frida 官方发布未提供 SHA-256，拒绝使用未校验二进制。")
     expected = digest.split(":", 1)[1].lower()
+    download_url = str(asset.get("browser_download_url") or "")
+    _validate_github_url(download_url, asset=True)
     try:
-        with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
-            payload = response.read()
+        with _open_github_url(download_url, timeout=120, asset=True) as response:
+            payload = _read_limited(
+                response, MAX_SERVER_DOWNLOAD_BYTES, "Frida Server"
+            )
     except Exception as exc:
         raise ExporterError(f"下载 Frida Server 失败：{exc}") from exc
     actual = hashlib.sha256(payload).hexdigest()
@@ -79,12 +171,17 @@ def prepare_server(adb: AdbClient, private_dir: Path) -> tuple[Path, str]:
             f"Frida Server SHA-256 不匹配：expected={expected}, actual={actual}"
         )
     compressed.write_bytes(payload)
-    server_payload = lzma.decompress(payload)
+    server_payload = _decompress_limited(payload, MAX_SERVER_UNCOMPRESSED_BYTES)
     server.write_bytes(server_payload)
     server_digest_path.write_text(
         hashlib.sha256(server_payload).hexdigest(), encoding="ascii"
     )
     compressed.unlink(missing_ok=True)
+    for path in (tools_dir, server, server_digest_path):
+        try:
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        except OSError:
+            pass
     return server, version
 
 
@@ -300,12 +397,14 @@ Java.performNow(function () {
         if script is not None:
             try:
                 script.unload()
-            except Exception:
+            # Best-effort cleanup continues with detach and device-side removal.
+            except Exception:  # nosec B110
                 pass
         if session is not None:
             try:
                 session.detach()
-            except Exception:
+            # A dead target process can make detach fail after export completed.
+            except Exception:  # nosec B110
                 pass
         if state.get("remote_plaintext"):
             adb.su(f"rm -f {AdbClient.quote(state['remote_plaintext'])}", check=False)

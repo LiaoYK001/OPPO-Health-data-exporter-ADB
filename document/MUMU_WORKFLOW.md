@@ -11,13 +11,13 @@ OPPO 健康 6.5.4 会主动检测 Root。检测到后显示风险提示，确认
 
 不要反复点击风险提示，不要清除 OPPO 健康数据，也不要卸载/重装 APP。无需 Magisk、LSPosed 或 Root 隐藏模块。
 
-## 2. 本轮数据安全状态
+## 2. 快照数据安全状态
 
-已经成功保存过一份 Root 原始快照，清单在：
+每次成功的 Root 原始快照都会生成只保存在本机的清单：
 
-`data/manifests/oppo-snapshot-5182eb1b-6f55-4832-bbe8-7730a8c9c4e4.json`
+`data/manifests/oppo-snapshot-<随机ID>.json`
 
-其中主健康库 `database.db` 使用 SQLCipher 加密。快照及其 WAL/SHM 已按 SHA-256 登记；关闭 Root 不会删除这份本地快照。当前可以直接从第 4 节继续。
+主健康库 `database.db` 可能使用 SQLCipher 加密。快照及其 WAL/SHM 会按 SHA-256 登记；关闭 Root 不会删除本地快照。清单、数据库文件名、哈希和随机 ID 都不应出现在公开 issue 或 PR 中。
 
 ## 3. 以后重新建立 Root 快照
 
@@ -127,7 +127,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\resume_ui_collecti
 如需随时查看进度、故障和详细日志，在项目目录执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1 -Workspace "C:\Users\czl1\Desktop\Project\OPPO-Health-data-exporter-ADB"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboard.ps1
 ```
 
 打开 `http://127.0.0.1:8765/`。监控页是只读工具，不会删除 `STOP_UI_COLLECTION`，不会恢复采集器，也不会向 MuMu 发送点击。页面包括：
@@ -171,4 +171,4 @@ req1 最终验收要求：
 
 ## 10. 隐私与容量
 
-`data/` 含健康数据、账号/设备原始字段、截图和数据库，已加入 `.gitignore`。不要将其上传到公开仓库。多年逐页证据可能占用 10–50GB；全量开始前预留空间，完成后制作两份加密备份。
+`data/` 含健康数据、账号/设备原始字段、截图和数据库，已加入 `.gitignore`。不要将其上传到公开仓库。多年逐页证据可能占用 10–50GB；全量开始前预留空间，完成后制作两份加密备份。公开提交前运行 `python .\scripts\public_release_check.py`，完整隐私说明见 [PRIVACY.md](../PRIVACY.md)。

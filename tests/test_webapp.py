@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from health_exporter.db import Database
-from health_exporter.webapp import WebAuth, create_web_app
+from health_exporter.webapp import (
+    LOGIN_BODY_MAX_BYTES,
+    LOGIN_MAX_FAILURES,
+    SCRYPT_N,
+    WebAuth,
+    create_web_app,
+)
+
+
+def _local_client(app: object) -> TestClient:
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def _source(
@@ -66,7 +78,7 @@ def test_web_api_selects_source_priority_without_overwriting_candidates(
     database.connection.commit()
     database.close()
 
-    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir)) as client:
         overview = client.get(
             "/api/v1/overview",
             params={"from": "2026-01-02", "to": "2026-01-02", "source": "unified"},
@@ -127,7 +139,7 @@ def test_activity_is_exposed_as_four_independent_metrics(tmp_path: Path) -> None
     database.connection.commit()
     database.close()
 
-    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir)) as client:
         metrics = client.get("/api/v1/metrics").json()
         overview = client.get(
             "/api/v1/overview",
@@ -203,7 +215,7 @@ def test_life_span_statistics_are_exact_while_trend_is_downsampled(
     database.connection.commit()
     database.close()
 
-    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir)) as client:
         response = client.get(
             "/api/v1/metrics/steps/daily",
             params={
@@ -267,7 +279,7 @@ def test_web_api_prefers_fidelity_when_priorities_match(tmp_path: Path) -> None:
     database.connection.commit()
     database.close()
 
-    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir)) as client:
         response = client.get(
             "/api/v1/metrics/heart_rate/daily",
             params={"from": "2026-02-03", "to": "2026-02-03"},
@@ -282,10 +294,18 @@ def test_lan_auth_protects_api_and_uses_http_only_cookie(tmp_path: Path) -> None
     database.close()
     auth = WebAuth(data_dir / "private" / "web-auth.json", enabled=True)
     auth.set_password("correct-horse")
+    password_config = json.loads(auth.config_path.read_text(encoding="utf-8"))
+    assert password_config["version"] == 2
+    assert password_config["n"] == SCRYPT_N
+    assert "correct-horse" not in auth.config_path.read_text(encoding="utf-8")
 
-    with TestClient(create_web_app(tmp_path, data_dir, auth=auth)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir, auth=auth)) as client:
         assert client.get("/api/v1/auth/status").status_code == 200
-        assert client.get("/api/v1/meta").status_code == 401
+        unauthorized = client.get("/api/v1/meta")
+        assert unauthorized.status_code == 401
+        assert unauthorized.headers["x-frame-options"] == "DENY"
+        assert "default-src 'self'" in unauthorized.headers["content-security-policy"]
+        assert unauthorized.headers["cache-control"] == "no-store"
         assert (
             client.post(
                 "/api/v1/auth/login", json={"password": "wrong-password"}
@@ -297,7 +317,102 @@ def test_lan_auth_protects_api_and_uses_http_only_cookie(tmp_path: Path) -> None
         )
         assert login.status_code == 200
         assert "HttpOnly" in login.headers["set-cookie"]
+        assert "SameSite=strict" in login.headers["set-cookie"]
         assert client.get("/api/v1/meta").status_code == 200
+
+
+def test_lan_auth_rate_limits_repeated_failures(tmp_path: Path) -> None:
+    data_dir, database = _database(tmp_path)
+    database.close()
+    auth = WebAuth(data_dir / "private" / "web-auth.json", enabled=True)
+    auth.set_password("correct-horse")
+
+    with _local_client(create_web_app(tmp_path, data_dir, auth=auth)) as client:
+        for _ in range(LOGIN_MAX_FAILURES):
+            response = client.post(
+                "/api/v1/auth/login", json={"password": "wrong-password"}
+            )
+            assert response.status_code == 401
+        blocked = client.post(
+            "/api/v1/auth/login", json={"password": "correct-horse"}
+        )
+
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) > 0
+
+
+def test_lan_auth_accepts_existing_version_one_password_hash(tmp_path: Path) -> None:
+    config_path = tmp_path / "private" / "web-auth.json"
+    config_path.parent.mkdir(parents=True)
+    salt = b"synthetic-salt!!"
+    digest = hashlib.scrypt(
+        b"correct-horse", salt=salt, n=2**14, r=8, p=1, dklen=32
+    )
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "algorithm": "scrypt",
+                "salt": salt.hex(),
+                "digest": digest.hex(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    auth = WebAuth(config_path, enabled=True)
+
+    assert auth.verify_password("correct-horse") is True
+
+
+def test_lan_auth_rejects_oversized_login_body(tmp_path: Path) -> None:
+    data_dir, database = _database(tmp_path)
+    database.close()
+    auth = WebAuth(data_dir / "private" / "web-auth.json", enabled=True)
+    auth.set_password("correct-horse")
+
+    with _local_client(create_web_app(tmp_path, data_dir, auth=auth)) as client:
+        response = client.post(
+            "/api/v1/auth/login",
+            content=b"x" * (LOGIN_BODY_MAX_BYTES + 1),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+
+
+def test_web_rejects_dns_rebinding_and_nonlocal_hosts(tmp_path: Path) -> None:
+    data_dir, database = _database(tmp_path)
+    database.close()
+    app = create_web_app(tmp_path, data_dir)
+
+    with _local_client(app) as client:
+        assert client.get("/api/v1/meta").status_code == 200
+        domain = client.get(
+            "/api/v1/meta", headers={"host": "attacker.example.invalid"}
+        )
+        private_ip = client.get(
+            "/api/v1/meta", headers={"host": "192.168.10.20:8765"}
+        )
+
+    assert domain.status_code == 400
+    assert private_ip.status_code == 400
+    assert domain.headers["x-frame-options"] == "DENY"
+
+
+def test_lan_web_accepts_private_ip_but_rejects_public_ip_host(tmp_path: Path) -> None:
+    data_dir, database = _database(tmp_path)
+    database.close()
+    app = create_web_app(tmp_path, data_dir, lan_access=True)
+
+    with TestClient(app, base_url="http://192.168.10.20:8765") as client:
+        private_ip = client.get("/api/v1/meta")
+        public_ip = client.get(
+            "/api/v1/meta", headers={"host": "8.8.8.8:8765"}
+        )
+
+    assert private_ip.status_code == 200
+    assert public_ip.status_code == 400
 
 
 def test_web_api_rejects_invalid_dates_and_unregistered_artifacts(
@@ -305,7 +420,7 @@ def test_web_api_rejects_invalid_dates_and_unregistered_artifacts(
 ) -> None:
     data_dir, database = _database(tmp_path)
     database.close()
-    with TestClient(create_web_app(tmp_path, data_dir)) as client:
+    with _local_client(create_web_app(tmp_path, data_dir)) as client:
         bad_date = client.get(
             "/api/v1/overview",
             params={"from": "2026-99-99", "to": "2026-01-01"},

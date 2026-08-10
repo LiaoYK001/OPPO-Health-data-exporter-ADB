@@ -3,8 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import getpass
 import hashlib
+import ipaddress
 import json
 import math
+import os
 import re
 import secrets
 import sqlite3
@@ -16,6 +18,7 @@ import webbrowser
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -40,6 +43,15 @@ MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SESSION_COOKIE = "health_archive_session"
 SESSION_SECONDS = 12 * 60 * 60
+LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
+LOGIN_BLOCK_SECONDS = 15 * 60
+LOGIN_MAX_FAILURES = 5
+LOGIN_BODY_MAX_BYTES = 4096
+SCRYPT_N = 2**15
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+SCRYPT_MAXMEM = 64 * 1024 * 1024
 OPPO_SLEEP_STAGE_STATES = {
     "0": "awake",
     "2": "deep",
@@ -73,6 +85,32 @@ def _date_range(date_from: str, date_to: str) -> tuple[str, str]:
     if start > end:
         raise HTTPException(400, "from 不能晚于 to")
     return start, end
+
+
+def _host_allowed(raw_host: str, *, lan_access: bool) -> bool:
+    if (
+        not raw_host
+        or len(raw_host) > 255
+        or any(character in raw_host for character in "/\\\r\n\t @")
+    ):
+        return False
+    try:
+        parsed = urlsplit(f"//{raw_host}")
+        host = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return False
+    if not host or parsed.username or parsed.password or parsed.path:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return bool(lan_access and (address.is_private or address.is_link_local))
 
 
 def _rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
@@ -239,7 +277,16 @@ class WebAuth:
         self.config_path = config_path
         self.enabled = enabled
         self._sessions: dict[str, float] = {}
+        self._login_failures: dict[str, list[float]] = {}
+        self._blocked_until: dict[str, float] = {}
         self._lock = threading.Lock()
+        if self.config_path.parent.exists():
+            try:
+                os.chmod(self.config_path.parent, 0o700)
+                if self.config_path.exists():
+                    os.chmod(self.config_path, 0o600)
+            except OSError:
+                pass
 
     def configured(self) -> bool:
         return self.config_path.is_file()
@@ -249,11 +296,21 @@ class WebAuth:
             raise ExporterError("局域网访问密码至少需要 8 个字符。")
         salt = secrets.token_bytes(16)
         digest = hashlib.scrypt(
-            password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32
+            password.encode("utf-8"),
+            salt=salt,
+            n=SCRYPT_N,
+            r=SCRYPT_R,
+            p=SCRYPT_P,
+            dklen=SCRYPT_DKLEN,
+            maxmem=SCRYPT_MAXMEM,
         )
         payload = {
-            "version": 1,
+            "version": 2,
             "algorithm": "scrypt",
+            "n": SCRYPT_N,
+            "r": SCRYPT_R,
+            "p": SCRYPT_P,
+            "dklen": SCRYPT_DKLEN,
             "salt": salt.hex(),
             "digest": digest.hex(),
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -262,6 +319,11 @@ class WebAuth:
         self.config_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        try:
+            os.chmod(self.config_path.parent, 0o700)
+            os.chmod(self.config_path, 0o600)
+        except OSError:
+            pass
 
     def configure_interactively(self, *, force: bool = False) -> None:
         if not self.enabled or (self.configured() and not force):
@@ -277,24 +339,58 @@ class WebAuth:
             raise ExporterError("两次输入的密码不一致。")
         self.set_password(first)
 
-    def verify_password(self, password: str) -> bool:
+    def retry_after(self, client_key: str) -> int:
+        now = time.time()
+        with self._lock:
+            self._purge_login_attempts(now)
+            return max(0, math.ceil(self._blocked_until.get(client_key, 0) - now))
+
+    def verify_password(self, password: str, client_key: str = "local") -> bool:
         if not self.enabled:
             return True
+        if self.retry_after(client_key):
+            return False
         try:
             payload = json.loads(self.config_path.read_text(encoding="utf-8"))
             salt = bytes.fromhex(payload["salt"])
             expected = bytes.fromhex(payload["digest"])
+            n = int(payload.get("n", 2**14))
+            r = int(payload.get("r", 8))
+            p = int(payload.get("p", 1))
+            dklen = int(payload.get("dklen", len(expected)))
+            if (
+                n not in {2**14, 2**15}
+                or r not in {8}
+                or p not in {1, 2}
+                or dklen != len(expected)
+                or not 16 <= dklen <= 64
+            ):
+                return False
             actual = hashlib.scrypt(
                 password.encode("utf-8"),
                 salt=salt,
-                n=2**14,
-                r=8,
-                p=1,
-                dklen=len(expected),
+                n=n,
+                r=r,
+                p=p,
+                dklen=dklen,
+                maxmem=SCRYPT_MAXMEM,
             )
-            return secrets.compare_digest(actual, expected)
+            valid = secrets.compare_digest(actual, expected)
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            return False
+            valid = False
+        now = time.time()
+        with self._lock:
+            self._purge_login_attempts(now)
+            if valid:
+                self._login_failures.pop(client_key, None)
+                self._blocked_until.pop(client_key, None)
+            else:
+                failures = self._login_failures.setdefault(client_key, [])
+                failures.append(now)
+                if len(failures) >= LOGIN_MAX_FAILURES:
+                    self._blocked_until[client_key] = now + LOGIN_BLOCK_SECONDS
+                    self._login_failures.pop(client_key, None)
+        return valid
 
     def create_session(self) -> str:
         token = secrets.token_urlsafe(32)
@@ -325,6 +421,18 @@ class WebAuth:
         for token, expiry in list(self._sessions.items()):
             if expiry <= now:
                 self._sessions.pop(token, None)
+
+    def _purge_login_attempts(self, now: float) -> None:
+        cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+        for client_key, values in list(self._login_failures.items()):
+            remaining = [value for value in values if value >= cutoff]
+            if remaining:
+                self._login_failures[client_key] = remaining
+            else:
+                self._login_failures.pop(client_key, None)
+        for client_key, expiry in list(self._blocked_until.items()):
+            if expiry <= now:
+                self._blocked_until.pop(client_key, None)
 
 
 class WebDataService:
@@ -584,36 +692,43 @@ class WebDataService:
         source_clause, source_parameters = self._source_clause(source)
         placeholders = ",".join("?" for _ in storage_metrics)
         chart_expression = "d.chart_json" if include_chart else "NULL"
+        query_template = """
+            SELECT d.id, d.source_id, d.canonical_metric, d.local_date,
+                   d.revision,
+                   json_remove(d.summary_json, '$.vendor_summaries')
+                       AS summary_json,
+                   __CHART_EXPRESSION__ AS chart_json, d.fidelity,
+                   d.is_partial, d.created_at, s.vendor, s.app_version,
+                   COALESCE(ps.priority,0) AS source_priority,
+                   COALESCE(ps.display_name, UPPER(s.vendor) || ' 健康') AS source_name
+              FROM daily_metrics_current d
+              JOIN sources s ON s.id=d.source_id
+              LEFT JOIN profile_sources ps
+                ON ps.source_id=d.source_id AND ps.profile_id=?
+             WHERE d.canonical_metric IN (__METRIC_PLACEHOLDERS__)
+               AND d.local_date BETWEEN ? AND ?
+               AND (ps.enabled=1 OR ps.enabled IS NULL)
+               __SOURCE_CLAUSE__
+             ORDER BY d.local_date, d.canonical_metric,
+                      COALESCE(ps.priority,0) DESC,
+                      CASE d.fidelity
+                        WHEN 'exact_source' THEN 5
+                        WHEN 'exact_ui' THEN 4
+                        WHEN 'visual_only' THEN 3
+                        WHEN 'no_data' THEN 2
+                        ELSE 1
+                      END DESC,
+                      d.revision DESC, d.source_id
+        """
+        # Replacements are fixed SQL tokens or generated '?' placeholders only.
+        query = (  # nosec B608
+            query_template.replace("__CHART_EXPRESSION__", chart_expression)
+            .replace("__METRIC_PLACEHOLDERS__", placeholders)
+            .replace("__SOURCE_CLAUSE__", source_clause)
+        )
         stored_rows = _rows(
             connection.execute(
-                f"""
-                SELECT d.id, d.source_id, d.canonical_metric, d.local_date,
-                       d.revision,
-                       json_remove(d.summary_json, '$.vendor_summaries')
-                           AS summary_json,
-                       {chart_expression} AS chart_json, d.fidelity,
-                       d.is_partial, d.created_at, s.vendor, s.app_version,
-                       COALESCE(ps.priority,0) AS source_priority,
-                       COALESCE(ps.display_name, UPPER(s.vendor) || ' 健康') AS source_name
-                  FROM daily_metrics_current d
-                  JOIN sources s ON s.id=d.source_id
-                  LEFT JOIN profile_sources ps
-                    ON ps.source_id=d.source_id AND ps.profile_id=?
-                 WHERE d.canonical_metric IN ({placeholders})
-                   AND d.local_date BETWEEN ? AND ?
-                   AND (ps.enabled=1 OR ps.enabled IS NULL)
-                   {source_clause}
-                 ORDER BY d.local_date, d.canonical_metric,
-                          COALESCE(ps.priority,0) DESC,
-                          CASE d.fidelity
-                            WHEN 'exact_source' THEN 5
-                            WHEN 'exact_ui' THEN 4
-                            WHEN 'visual_only' THEN 3
-                            WHEN 'no_data' THEN 2
-                            ELSE 1
-                          END DESC,
-                          d.revision DESC, d.source_id
-                """,
+                query,
                 [
                     profile_id,
                     *storage_metrics,
@@ -789,24 +904,14 @@ class WebDataService:
                 source=source,
             )
             selected = self._selected(candidates)
-            coverage_source_clause = ""
-            parameters: list[Any] = [stored_metric, start, end]
-            if source != "unified":
-                try:
-                    coverage_source_clause = " AND c.source_id=?"
-                    parameters.append(int(source))
-                except ValueError as exc:
-                    raise HTTPException(400, "source 参数无效") from exc
-            coverage = _rows(
-                connection.execute(
-                    f"""
+            if source == "unified":
+                coverage_query = """
                     SELECT c.source_id, c.local_date, c.status, c.updated_at,
                            s.vendor
                       FROM coverage c
                       JOIN sources s ON s.id=c.source_id
                      WHERE c.canonical_metric=?
                        AND c.local_date BETWEEN ? AND ?
-                       {coverage_source_clause}
                      ORDER BY c.local_date,
                               CASE c.status
                                 WHEN 'exact_source' THEN 5
@@ -815,7 +920,34 @@ class WebDataService:
                                 WHEN 'no_data' THEN 2
                                 ELSE 1
                               END DESC
-                    """,
+                """
+                parameters: list[Any] = [stored_metric, start, end]
+            else:
+                try:
+                    source_id = int(source)
+                except ValueError as exc:
+                    raise HTTPException(400, "source 参数无效") from exc
+                coverage_query = """
+                    SELECT c.source_id, c.local_date, c.status, c.updated_at,
+                           s.vendor
+                      FROM coverage c
+                      JOIN sources s ON s.id=c.source_id
+                     WHERE c.canonical_metric=?
+                       AND c.local_date BETWEEN ? AND ?
+                       AND c.source_id=?
+                     ORDER BY c.local_date,
+                              CASE c.status
+                                WHEN 'exact_source' THEN 5
+                                WHEN 'exact_ui' THEN 4
+                                WHEN 'visual_only' THEN 3
+                                WHEN 'no_data' THEN 2
+                                ELSE 1
+                              END DESC
+                """
+                parameters = [stored_metric, start, end, source_id]
+            coverage = _rows(
+                connection.execute(
+                    coverage_query,
                     parameters,
                 )
             )
@@ -866,26 +998,36 @@ class WebDataService:
             selected_rows = self._selected(candidates)
             selected = selected_rows[0] if selected_rows else None
             if selected is None:
-                coverage_clause = ""
-                coverage_parameters: list[Any] = [stored_metric, day]
-                if source != "unified":
-                    try:
-                        coverage_clause = " AND c.source_id=?"
-                        coverage_parameters.append(int(source))
-                    except ValueError as exc:
-                        raise HTTPException(400, "source 参数无效") from exc
-                coverage = _rows(
-                    connection.execute(
-                        f"""
+                if source == "unified":
+                    coverage_query = """
                         SELECT c.source_id, c.status, c.detail_json, c.updated_at,
                                s.vendor
                           FROM coverage c JOIN sources s ON s.id=c.source_id
                          WHERE c.canonical_metric=? AND c.local_date=?
-                           {coverage_clause}
                          ORDER BY CASE c.status
                            WHEN 'exact_source' THEN 5 WHEN 'exact_ui' THEN 4
                            WHEN 'visual_only' THEN 3 WHEN 'no_data' THEN 2 ELSE 1 END DESC
-                        """,
+                    """
+                    coverage_parameters: list[Any] = [stored_metric, day]
+                else:
+                    try:
+                        source_id = int(source)
+                    except ValueError as exc:
+                        raise HTTPException(400, "source 参数无效") from exc
+                    coverage_query = """
+                        SELECT c.source_id, c.status, c.detail_json, c.updated_at,
+                               s.vendor
+                          FROM coverage c JOIN sources s ON s.id=c.source_id
+                         WHERE c.canonical_metric=? AND c.local_date=?
+                           AND c.source_id=?
+                         ORDER BY CASE c.status
+                           WHEN 'exact_source' THEN 5 WHEN 'exact_ui' THEN 4
+                           WHEN 'visual_only' THEN 3 WHEN 'no_data' THEN 2 ELSE 1 END DESC
+                    """
+                    coverage_parameters = [stored_metric, day, source_id]
+                coverage = _rows(
+                    connection.execute(
+                        coverage_query,
                         coverage_parameters,
                     )
                 )
@@ -1212,6 +1354,7 @@ def create_web_app(
     *,
     serial: str = DEFAULT_SERIAL,
     auth: WebAuth | None = None,
+    lan_access: bool = False,
 ) -> FastAPI:
     workspace = workspace.resolve()
     data_dir = data_dir.resolve()
@@ -1225,22 +1368,44 @@ def create_web_app(
         openapi_url="/api/openapi.json",
     )
 
+    def add_security_headers(response: Response, path: str) -> Response:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; "
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+            "form-action 'self'",
+        )
+        if path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
     @app.middleware("http")
     async def protect_private_api(request: Request, call_next: Any) -> Response:
         path = request.url.path
+        if not _host_allowed(request.headers.get("host", ""), lan_access=lan_access):
+            return add_security_headers(
+                JSONResponse({"detail": "Host 不允许"}, status_code=400), path
+            )
         public = {
             "/api/v1/auth/status",
             "/api/v1/auth/login",
             "/api/openapi.json",
         }
         if path.startswith("/api/") and path not in public and not auth.authenticated(request):
-            return JSONResponse({"detail": "需要登录"}, status_code=401)
+            return add_security_headers(
+                JSONResponse({"detail": "需要登录"}, status_code=401), path
+            )
         response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        if path.startswith("/api/"):
-            response.headers.setdefault("Cache-Control", "no-store")
-        return response
+        return add_security_headers(response, path)
 
     @app.get("/api/v1/auth/status")
     def auth_status(request: Request) -> dict[str, Any]:
@@ -1251,8 +1416,26 @@ def create_web_app(
 
     @app.post("/api/v1/auth/login")
     async def login(request: Request) -> Response:
-        payload = await request.json()
-        if not auth.verify_password(str(payload.get("password", ""))):
+        client_key = request.client.host if request.client else "unknown"
+        retry_after = auth.retry_after(client_key)
+        if retry_after:
+            return JSONResponse(
+                {"detail": "登录尝试过多，请稍后重试"},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > LOGIN_BODY_MAX_BYTES:
+                raise HTTPException(413, "登录请求过大")
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "登录请求不是有效 JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "登录请求必须是 JSON 对象")
+        if not auth.verify_password(str(payload.get("password", "")), client_key):
             raise HTTPException(401, "密码错误")
         token = auth.create_session()
         response = JSONResponse({"authenticated": True})
@@ -1434,12 +1617,21 @@ def serve_web(args: Any, *, initial_path: str = "/") -> int:
         pass
 
     lan = bool(getattr(args, "lan", False))
-    host = "0.0.0.0" if lan else str(getattr(args, "host", "127.0.0.1"))
+    # Binding all interfaces requires the explicit --lan flag and password auth.
+    host = "0.0.0.0" if lan else str(  # nosec B104
+        getattr(args, "host", "127.0.0.1")
+    )
     if host not in {"127.0.0.1", "localhost", "::1"} and not lan:
         raise ExporterError("非本机监听必须显式添加 --lan。")
     auth = WebAuth(data_dir / "private" / "web-auth.json", enabled=lan)
     auth.configure_interactively(force=bool(getattr(args, "reset_password", False)))
-    app = create_web_app(workspace, data_dir, serial=args.serial, auth=auth)
+    app = create_web_app(
+        workspace,
+        data_dir,
+        serial=args.serial,
+        auth=auth,
+        lan_access=lan,
+    )
     port = int(args.port)
     local_url = f"http://127.0.0.1:{port}{initial_path}"
     print(f"健康数据中枢：{local_url}", flush=True)
