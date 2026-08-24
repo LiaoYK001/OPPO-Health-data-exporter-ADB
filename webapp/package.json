@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "echarts": "^6.0.0",
-    "lucide-react": "^1.31.0",
+    "lucide-react": "^1.33.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
