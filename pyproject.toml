@@ -27,7 +27,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "numpy>=2.0,<3",
   "openpyxl>=3.1,<4",
-  "Pillow>=11.0,<13",
+  "Pillow>=11.0,<14",
   "tzdata>=2025.2; platform_system == 'Windows'",
   "uvicorn>=0.32,<1",
 ]
